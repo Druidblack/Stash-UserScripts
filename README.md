@@ -17,3 +17,16 @@ With one click, it selects duplicates other than the one you selected in the set
 
 The script works in several stages. The script receives data about the video resolution and the codecs used when the page loads. Later, when navigating through the pages, the script can use previously received data, or you can update the page and the script will receive new data.
 The script checks video resolutions based on the frame height. If you have videos that differ slightly in frame width, the script will still perceive them as having the same resolution.
+
+The script checks the video characteristics in several stages. 
+
+1. Checks the video resolution. In this case, it leaves the video resolution that you specified by marking the rest for deletion.
+
+2. If the videos have the same resolution, but the script will check which codec is selected as the priority.
+
+3. If the videos are completely identical in resolution and codec, the script will select the video by the minimum or maximum bitrate.
+
+4. If the videos are completely identical, the script will leave the first video in the group.
+
+[![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/stash_auto_check_with_height_priority.user.js)
+[![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/stash_auto_check_with_height_priority.user.js)
