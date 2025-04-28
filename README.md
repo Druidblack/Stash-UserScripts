@@ -30,3 +30,12 @@ The script checks the video characteristics in several stages.
 
 [![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/stash_auto_check_with_height_priority.user.js)
 [![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/stash_auto_check_with_height_priority.user.js)
+
+## Stash Blur
+![2](https://github.com/Druidblack/Stash-UserScripts/blob/main/add/anim.gif)
+
+Adds an on/off blurring button to the application page and a slider to display the degree of blurring.
+
+[![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/stash_blur.user.js)
+[![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/stash_blur.user.js)
+
