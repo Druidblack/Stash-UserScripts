@@ -36,6 +36,14 @@ The script checks the video characteristics in several stages.
 
 Adds an on/off blurring button to the application page and a slider to display the degree of blurring.
 
+[![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/button_clicker.user.js)
+[![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/button_clicker.user.js)
+
+## Auto Delete File Button Clicker for Stash
+
+![3](https://github.com/Druidblack/Stash-UserScripts/blob/main/add/444.jpg)
+
+If the video has a Scene in which several videos are combined, the script will prompt you to delete one of the files immediately (you do not need to navigate through the menu). This script was needed to simplify the deletion of identical videos, which stash combined into one scene and did not show them when searching for duplicates.
+
 [![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/stash_blur.user.js)
 [![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/stash_blur.user.js)
-
