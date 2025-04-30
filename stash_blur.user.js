@@ -17,7 +17,7 @@
     const BLUR_STYLE_ID = 'tm-blur-style';
     const CTRL_STYLE_ID = 'tm-controls-style';
 
-    // 1) Всегда-включаемые CSS для выравнивания navbar и фиксированных контролов
+    // 1) Всегда-включаемые CSS для выравнивания navbar и контролов
     function injectControlStyles() {
         if (document.getElementById(CTRL_STYLE_ID)) return;
         const css = `
@@ -56,25 +56,38 @@
         (document.head || document.documentElement).prepend(style);
     }
 
-    // 2) CSS размытия, toggled кнопкой, расширено под img.hoverZoomLink
+    // 2) CSS размытия, toggled кнопкой, расширено под все нужные селекторы
     function injectBlurStyles() {
         if (document.getElementById(BLUR_STYLE_ID)) return;
         const css = `
 :root { --tm-blur-size: 8px; }
 
-/* Применяем blur к превью-сценам, картинкам исполнителей, групп и sprite-картинкам */
+/* Применяем blur к превью-сценам, картинкам исполнителей, групп, sprite-картинкам, миниатюрам, самим карточкам сцен, wall-item-media изображениям и видео */
 .video-section.thumbnail-section .scene-card-preview,
 img.performer-card-image,
 img.group-card-image,
-img.hoverZoomLink {
+img.hoverZoomLink,
+img.image-thumbnail,
+.scene-card.mr-3,
+img.wall-item-media,
+img.wall-item-media.hoverZoomLink,
+video.wall-item-media,
+video.hoverZoomLink {
     filter: blur(var(--tm-blur-size)) !important;
     transition: filter 0.2s ease-in-out;
 }
+
 /* Снимаем blur при hover */
 .video-section.thumbnail-section .scene-card-preview:hover,
 img.performer-card-image:hover,
 img.group-card-image:hover,
-img.hoverZoomLink:hover {
+img.hoverZoomLink:hover,
+img.image-thumbnail:hover,
+.scene-card.mr-3:hover,
+img.wall-item-media:hover,
+img.wall-item-media.hoverZoomLink:hover,
+video.wall-item-media:hover,
+video.hoverZoomLink:hover {
     filter: none !important;
 }`;
         const style = document.createElement('style');
