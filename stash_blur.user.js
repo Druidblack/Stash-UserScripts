@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Stash Blur
 // @namespace    https://github.com/Druidblack/Stash-UserScripts
-// @version      1.0
+// @version      1.1
 // @description  Blurs preview scenes, images of performers and bands in Stash as early as possible, as well as sprite images (img.hoverZoomLink), removes blur during hover, adds a slider and a button on the left to control blur.
 // @match        http://*:9999/*
 // @grant        none
