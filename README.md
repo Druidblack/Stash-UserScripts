@@ -47,3 +47,12 @@ If the video has a Scene in which several videos are combined, the script will p
 
 [![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/button_clicker.user.js)
 [![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/button_clicker.user.js)
+
+## Auto-check “Delete file”
+
+![4](https://github.com/Druidblack/Stash-UserScripts/blob/main/add/555.jpg)
+
+Automatically ticks the box "Delete file (along with funscript)"
+
+[![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/stash_check_delete_file.user.js)
+[![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/stash_check_delete_file.user.js)
