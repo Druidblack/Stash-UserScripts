@@ -56,3 +56,12 @@ Automatically ticks the box "Delete file (along with funscript)"
 
 [![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/stash_check_delete_file.user.js)
 [![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/stash_check_delete_file.user.js)
+
+## Data Matches for StashResults”
+
+<img width="1694" height="379" alt="66666" src="https://github.com/user-attachments/assets/b13035cb-4727-4dcf-b4bc-5b5739ec31b8" />
+
+Color-coding the best match of the found information to identify the video and automatically matching when multiple similar results are found.
+
+[![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/stash-DataMatchHighlighter.user.js)
+[![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/stash-DataMatchHighlighter.user.js)
