@@ -1,0 +1,2967 @@
+// ==UserScript==
+// @name         Data Matches for StashResults
+// @namespace    http://kennyg.com/
+// @version      1.19.6.17
+// @description  Highlights components of the matches from StashBox
+// @author       KennyG
+// @match        *://192.168.1.201:9999/scenes*
+// @match        *://192.168.1.201:9999/groups*
+// @match        *://192.168.1.201:9999/performers*
+// @grant        none
+// @run-at       document-end
+// @icon         https://raw.githubusercontent.com/stashapp/stash/develop/ui/v2.5/public/favicon.png
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // Global constant for color
+    const HIGHLIGHT_COLOR = '#00796B'; // Teal color
+    const VERIFIED_MATCH_BACKGROUND_COLOR = 'rgba(0, 121, 107, 0.5)'; // Same as optional-field-content
+    const NEAR_DATE_MATCH_BACKGROUND_COLOR = 'rgba(255, 111, 0, 0.75)'; // Orange: date differs by one day
+
+    // Optional helper button near the Stash scraper toolbar.
+    // When enabled, it adds a button that clicks every visible
+    // "Scrape by fragment / Скрейпить по фрагменту" button on the current page.
+    const ENABLE_SCRAPE_BY_FRAGMENT_ALL_BUTTON = true;
+    const SCRAPE_BY_FRAGMENT_ALL_BUTTON_TEXT = 'Скрейпить все фрагменты';
+    const SCRAPE_BY_FRAGMENT_BUTTON_TEXTS = [
+        'Скрейпить по фрагменту',
+        'Scrape by fragment'
+    ];
+    // Delay after finishing one fragment before starting the next scrape request.
+    // This protects Stash/StashBox from rapid-fire requests during mass scraping.
+    const SCRAPE_BY_FRAGMENT_CLICK_DELAY_MS = 750;
+    const SCRAPE_BY_FRAGMENT_WAIT_FOR_RESULT = true;
+    const SCRAPE_BY_FRAGMENT_WAIT_TIMEOUT_MS = 20000;
+    const SCRAPE_BY_FRAGMENT_POLL_INTERVAL_MS = 250;
+
+    // Some Stash pages render/update scraper rows lazily and only continue
+    // painting the result DOM after a real scroll/resize activity. During a long
+    // unattended mass scrape this can look like a random stop: the current row is
+    // waiting for comparison data, and manual scrolling makes it continue.
+    // Keep the active row in view and periodically dispatch scroll/resize events
+    // while waiting, so React/Stash keeps rendering without manual interaction.
+    const ENABLE_SCRAPE_ITEM_SCROLL_WAKE = true;
+    const SCRAPE_ITEM_SCROLL_WAKE_SETTLE_MS = 150;
+    const SCRAPE_WAIT_SCROLL_WAKE_INTERVAL_MS = 1500;
+
+    // When Stash is currently scraping one fragment, the clicked button becomes
+    // disabled and contains a LoadingIndicator spinner. At that moment Stash also
+    // disables the other "Scrape by fragment" buttons. Do not treat the page as
+    // finished or move to the next pagination page while this UI lock is active.
+    const SCRAPE_ACTIVE_LOADING_POLL_INTERVAL_MS = 500;
+    const SCRAPE_ACTIVE_LOADING_STATUS_INTERVAL_MS = 5000;
+    // 0 = wait indefinitely. This is intentional: moving to the next page while
+    // Stash is still waiting for scraper data loses the current request.
+    const SCRAPE_ACTIVE_LOADING_MAX_WAIT_MS = 0;
+
+    // Full automation mode for the mass scrape button. A single click now:
+    // 1) processes the current visible page;
+    // 2) repeats the page when successful saves remove rows and Stash loads new rows;
+    // 3) moves to the next pagination page when the current page has no more
+    //    actionable rows except items already remembered as no automatic match.
+    const ENABLE_SCRAPE_AUTO_REPEAT_CURRENT_PAGE = true;
+    const ENABLE_SCRAPE_AUTO_NEXT_PAGE = true;
+    // Safety limits. 0 means no explicit limit.
+    const SCRAPE_AUTO_MAX_PASSES_PER_PAGE = 0;
+    const SCRAPE_AUTO_MAX_PAGES = 0;
+    const SCRAPE_AUTO_AFTER_PASS_DELAY_MS = 1500;
+    const SCRAPE_AUTO_NEXT_PAGE_WAIT_TIMEOUT_MS = 30000;
+    const SCRAPE_AUTO_NEXT_PAGE_POLL_INTERVAL_MS = 300;
+    // After clicking Next, Stash/React can update the page counter before the new
+    // search-item list is actually ready. Do not start scraping the next page
+    // until at least one row is present and the row list has stayed unchanged
+    // for this amount of time.
+    const SCRAPE_AUTO_NEXT_PAGE_SETTLE_MS = 1200;
+    const SCRAPE_AUTO_NEXT_PAGE_READY_STABLE_MS = 2500;
+    const SCRAPE_AUTO_NEXT_PAGE_MIN_WAIT_MS = 1200;
+    // Before going to the next page, verify several times that the current
+    // page really has no actionable rows left. This prevents fast page flips
+    // while Stash is still refilling the current page after successful saves.
+    const SCRAPE_AUTO_PAGE_EXHAUSTED_WAIT_TIMEOUT_MS = 20000;
+    const SCRAPE_AUTO_PAGE_EXHAUSTED_CHECK_INTERVAL_MS = 1000;
+    const SCRAPE_AUTO_PAGE_EXHAUSTED_STABLE_MS = 5000;
+
+    // Persistent progress counter in the top navbar, inserted next to the
+    // "New / Новый" button. It remains visible after the mass scrape stops.
+    const ENABLE_SCRAPE_PROGRESS_NAVBAR_COUNTER = true;
+    const SCRAPE_PROGRESS_NAVBAR_COUNTER_IDLE_TEXT = 'DMH: остановлен';
+
+    // Optional pause/resume button for the long mass scrape automation.
+    // Pause is cooperative: if Stash has already started scraping one fragment,
+    // the script first waits for that active Stash request/result to finish and
+    // then stops before the next safe action: next fragment, auto-save, or page turn.
+    const ENABLE_SCRAPE_PAUSE_BUTTON = true;
+    const SCRAPE_PAUSE_BUTTON_TEXT = 'Пауза';
+    const SCRAPE_RESUME_BUTTON_TEXT = 'Продолжить';
+    const SCRAPE_PAUSE_POLL_INTERVAL_MS = 300;
+    const SCRAPE_PAUSE_FLOATING_POSITION_KEY = 'DataMatchesForStashResults.pauseButtonFloatingPosition.v1';
+    const SCRAPE_PAUSE_FLOATING_DEFAULT_LEFT_PX = 24;
+    const SCRAPE_PAUSE_FLOATING_DEFAULT_TOP_PX = 140;
+
+
+    // Optional auto-save after scraping one fragment.
+    // It saves only when a scraper result has a high fingerprint ratio AND
+    // at least one meaningful field match: date, studio, performer/actor, or title.
+    const ENABLE_AUTO_SAVE_HIGH_CONFIDENCE_AFTER_FRAGMENT = true;
+    const AUTO_SAVE_HIGH_CONFIDENCE_FINGERPRINT_PERCENT = 0.90;
+    const AUTO_SAVE_HIGH_CONFIDENCE_MIN_MATCHED_FINGERPRINTS = 8;
+    // Secondary rule: slightly lower fingerprint percent is still safe when
+    // several meaningful metadata fields agree. Example: 17/19 = 89.47%,
+    // which is below 90%, but should be saved when title/date/performer/studio
+    // also match.
+    const AUTO_SAVE_STRONG_FIELDS_FINGERPRINT_PERCENT = 0.85;
+    const AUTO_SAVE_STRONG_FIELDS_MIN_FIELD_MATCHES = 2;
+    // Delay after selecting a candidate result before looking for/clicking Save.
+    const AUTO_SAVE_CLICK_DELAY_MS = 2000;
+    // Extra delay right before pressing Save and after pressing Save.
+    // These pauses make automatic scraping/saving less aggressive.
+    const AUTO_SAVE_BEFORE_SAVE_CLICK_DELAY_MS = 600;
+    const AUTO_SAVE_AFTER_SAVE_CLICK_DELAY_MS = 900;
+    // After StashBox returns scraper results, React can still render metadata fields
+    // and the per-result Save button a little later. Retry auto-save briefly before
+    // writing the file name to session memory as "no automatic match".
+    const AUTO_SAVE_CANDIDATE_RETRY_TIMEOUT_MS = 5000;
+    const AUTO_SAVE_CANDIDATE_RETRY_INTERVAL_MS = 2000;
+    const AUTO_SAVE_SAVE_BUTTON_WAIT_TIMEOUT_MS = 3000;
+    const AUTO_SAVE_SAVE_BUTTON_WAIT_INTERVAL_MS = 2000;
+    const AUTO_SAVE_BUTTON_TEXTS = [
+        'Сохранить',
+        'Save'
+    ];
+
+    // Session-only memory for files that were already scraped during this browser
+    // session but did not produce an automatic high-confidence save. This avoids
+    // repeating expensive "Scrape by fragment" requests when pressing the mass
+    // scrape button again. The memory is kept in sessionStorage, so it is cleared
+    // when the browser/tab session is closed.
+    const ENABLE_SCRAPE_SESSION_MEMORY_FOR_NO_AUTO_MATCH = true;
+    const SCRAPE_SESSION_MEMORY_KEY = 'DataMatchesForStashResults.noAutoMatchFilenames.v3';
+
+    // Optional button near the mass scrape button that clears the session-only
+    // "no automatic match" memory. Use it when you want the next mass scrape
+    // run to retry files that were previously skipped during the current session.
+    const ENABLE_CLEAR_SCRAPE_SESSION_MEMORY_BUTTON = true;
+    const CLEAR_SCRAPE_SESSION_MEMORY_BUTTON_TEXT = 'Очистить память';
+
+
+    // Alias groups for filename/query-to-entity matching.
+    // Add new aliases as additional values in the same group.
+    // Example: filename token "t4k" should match entity/studio "Tiny 4K".
+    const MATCH_ALIAS_GROUPS = [
+        ['t4k', 'Tiny 4K'],
+		['tla', 'Teens Love Anal'],
+		['18OG', '18 Only Girls']
+    ];
+
+    // SVG icon shown when the date/entity is fully verified from the filename
+    const VERIFIED_ICON_SVG = '<svg aria-hidden="true" focusable="false" data-prefix="far" data-icon="circle-check" class="svg-inline--fa fa-circle-check fa-icon SceneTaggerIcon" role="img" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" color="#0f9960"><path fill="currentColor" d="M243.8 339.8C232.9 350.7 215.1 350.7 204.2 339.8L140.2 275.8C129.3 264.9 129.3 247.1 140.2 236.2C151.1 225.3 168.9 225.3 179.8 236.2L224 280.4L332.2 172.2C343.1 161.3 360.9 161.3 371.8 172.2C382.7 183.1 382.7 200.9 371.8 211.8L243.8 339.8zM512 256C512 397.4 397.4 512 256 512C114.6 512 0 397.4 0 256C0 114.6 114.6 0 256 0C397.4 0 512 114.6 512 256zM256 48C141.1 48 48 141.1 48 256C48 370.9 141.1 464 256 464C370.9 464 464 370.9 464 256C464 141.1 370.9 48 256 48z"></path></svg>';
+
+    // Fingerprint color rules
+    const COLOR_RULES = [
+        {
+            range: [0, 10],
+            colors: [
+                { threshold: 0.45, color: '#B71C1C' }, // Crimson
+                { threshold: 0.60, color: '#FF6F00' }, // Orange800
+                { threshold: 1.00, color: '#00796B' }  // Pine Green
+            ]
+        },
+        {
+            range: [11, 50],
+            colors: [
+                { threshold: 0.30, color: '#B71C1C' }, // Crimson
+                { threshold: 0.50, color: '#FF6F00' }, // Orange800
+                { threshold: 0.75, color: '#BBBE64' }, // Citron
+                { threshold: 1.00, color: '#00796B' }  // Pine Green
+            ]
+        },
+        {
+            range: [51, Infinity],
+            colors: [
+                { threshold: 0.20, color: '#B71C1C' }, // Crimson
+                { threshold: 0.40, color: '#FF6F00' }, // Orange800
+                { threshold: 0.75, color: '#BBBE64' }, // Citron
+                { threshold: 1.00, color: '#00796B' }  // Pine Green
+            ]
+        }
+    ];
+
+    function getFingerprintColor(total, percent) {
+        for (let rule of COLOR_RULES) {
+            if (total >= rule.range[0] && total <= rule.range[1]) {
+                for (let i = 0; i < rule.colors.length; i++) {
+                    if (percent <= rule.colors[i].threshold) {
+                        return rule.colors[i].color;
+                    }
+                }
+            }
+        }
+        return '';
+    }
+
+    // Function to check if date components (YY, MM, DD) are found in the title.
+    // Keep the old partial-match behavior from 1.19, but do NOT match date parts
+    // inside unrelated longer numbers. For example, 2014-10-14 must not match
+    // filename/query "21.08.14_1080" just because "10" exists inside "1080".
+    function checkDateInTitle(dateText, titleText) {
+        const dateMatch = dateText.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!dateMatch) return false;
+
+        const [, year, searchMM, searchDD] = dateMatch;
+        const searchYY = year.slice(2); // Get the last two digits of the year (YY)
+        const components = [searchYY, searchMM, searchDD];
+
+        // Extract numeric tokens from the filename/query. This makes "10" match
+        // only a standalone numeric token "10", not the first two digits of "1080".
+        const numberTokens = (titleText.match(/\d+/g) || []).slice();
+        if (numberTokens.length === 0) return false;
+
+        // Consume tokens one by one so repeated components, e.g. 14-10-14,
+        // require enough real occurrences in the filename/query.
+        return components.every(component => {
+            const index = numberTokens.findIndex(token => token === component);
+            if (index === -1) return false;
+            numberTokens.splice(index, 1);
+            return true;
+        });
+    }
+
+    // Check for year-only partial date match from filenames like:
+    // "Dakota Tyler - [Tiny4K.com] - [2022] - Tiny Temptation.mp4".
+    // The bracketed year is treated as a real production/release year and can
+    // partially match result dates such as "2022-05-17". This intentionally
+    // requires square/round brackets so random numbers in filenames do not
+    // become date evidence.
+    function isYearPartiallyMatched(dateText, titleText) {
+        const dateMatch = dateText.match(/^(\d{4})-\d{2}-\d{2}$/);
+        if (!dateMatch) return false;
+
+        const year = dateMatch[1];
+        const escapedYear = year.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const bracketedYearPattern = new RegExp(`[\\[\\(]\\s*${escapedYear}\\s*[\\]\\)]`);
+
+        return bracketedYearPattern.test(titleText || '');
+    }
+
+
+
+    function makeUtcDayNumber(year, month, day) {
+        const y = Number(year);
+        const m = Number(month);
+        const d = Number(day);
+        if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d)) return null;
+        if (y < 1900 || y > 2099 || m < 1 || m > 12 || d < 1 || d > 31) return null;
+
+        const date = new Date(Date.UTC(y, m - 1, d));
+        if (
+            date.getUTCFullYear() !== y ||
+            date.getUTCMonth() !== m - 1 ||
+            date.getUTCDate() !== d
+        ) {
+            return null;
+        }
+
+        return Math.floor(date.getTime() / 86400000);
+    }
+
+    function parseIsoDateToUtcDay(dateText) {
+        const match = (dateText || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!match) return null;
+        return makeUtcDayNumber(match[1], match[2], match[3]);
+    }
+
+    function expandTwoDigitYear(twoDigitYear) {
+        const yy = Number(twoDigitYear);
+        if (!Number.isInteger(yy)) return null;
+        return yy >= 70 ? 1900 + yy : 2000 + yy;
+    }
+
+    function addSourceDateCandidate(candidates, year, month, day) {
+        const dayNumber = makeUtcDayNumber(year, month, day);
+        if (dayNumber === null) return;
+        candidates.push(dayNumber);
+    }
+
+    function getSourceDateCandidates(sourceText) {
+        const haystack = sourceText || '';
+        const candidates = [];
+        const seenKeys = new Set();
+
+        function addUnique(year, month, day) {
+            const key = `${year}-${month}-${day}`;
+            if (seenKeys.has(key)) return;
+            seenKeys.add(key);
+            addSourceDateCandidate(candidates, year, month, day);
+        }
+
+        // YYYY.MM.DD / YYYY-MM-DD / YYYY MM DD
+        haystack.replace(/(^|\D)(\d{4})[.\- ](\d{2})[.\- ](\d{2})(?=\D|$)/g, (full, prefix, year, mm, dd) => {
+            addUnique(year, mm, dd);
+            return full;
+        });
+
+        // YY.MM.DD / YY-MM-DD / YY MM DD, e.g. pervmom.18.03.10 -> 2018-03-10
+        haystack.replace(/(^|\D)(\d{2})[.\- ](\d{2})[.\- ](\d{2})(?=\D|$)/g, (full, prefix, yy, mm, dd) => {
+            const year = expandTwoDigitYear(yy);
+            if (year !== null) addUnique(year, mm, dd);
+            return full;
+        });
+
+        // DD.MM.YYYY / DD-MM-YYYY / DD MM YYYY
+        haystack.replace(/(^|\D)(\d{2})[.\- ](\d{2})[.\- ](\d{4})(?=\D|$)/g, (full, prefix, dd, mm, year) => {
+            addUnique(year, mm, dd);
+            return full;
+        });
+
+        // Compact YYMMDD, e.g. 180310
+        haystack.replace(/(^|\D)(\d{6})(?=\D|$)/g, (full, prefix, compact) => {
+            const yy = compact.slice(0, 2);
+            const mm = compact.slice(2, 4);
+            const dd = compact.slice(4, 6);
+            const year = expandTwoDigitYear(yy);
+            if (year !== null) addUnique(year, mm, dd);
+            return full;
+        });
+
+        // Compact YYYYMMDD and DDMMYYYY. Both are attempted and invalid dates are ignored.
+        haystack.replace(/(^|\D)(\d{8})(?=\D|$)/g, (full, prefix, compact) => {
+            addUnique(compact.slice(0, 4), compact.slice(4, 6), compact.slice(6, 8));
+            addUnique(compact.slice(4, 8), compact.slice(2, 4), compact.slice(0, 2));
+            return full;
+        });
+
+        return candidates;
+    }
+
+    function isDateWithinOneDay(dateText, sourceText) {
+        const resultDay = parseIsoDateToUtcDay(dateText);
+        if (resultDay === null) return false;
+
+        return getSourceDateCandidates(sourceText).some(sourceDay =>
+            Math.abs(resultDay - sourceDay) === 1
+        );
+    }
+
+    function getDateMatchStatus(dateText, sourceText) {
+        if (isDateVerified(dateText, sourceText)) return 'exact';
+        if (isDateWithinOneDay(dateText, sourceText)) return 'near';
+        if (checkDateInTitle(dateText, sourceText)) return 'partial';
+        if (isYearPartiallyMatched(dateText, sourceText)) return 'year';
+        return 'none';
+    }
+
+    // Function to check for a fully verified date pattern in the title.
+    // e.g. dateText "2021-08-05" matches:
+    // - "21.08.05", "21-08-05", "21 08 05", or "210805"
+    // - "2021.08.05", "2021-08-05", or "2021 08 05"
+    // - European filename dates like "05.08.2021", "05-08-2021", or "05 08 2021"
+    function isDateVerified(dateText, titleText) {
+        const match = dateText.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!match) return false;
+
+        const [, year, mm, dd] = match;
+        const yy = year.slice(2);
+
+        // Allow common delimiters between parts, and don't require strict \b at the left,
+        // because filenames often have an underscore or letter before the year.
+        const patterns = [
+            // YY.MM.DD, YY-MM-DD, YY MM DD
+            new RegExp(`${yy}[.\\- ]${mm}[.\\- ]${dd}`),
+            // YYYY.MM.DD, YYYY-MM-DD, YYYY MM DD
+            new RegExp(`${year}[.\\- ]${mm}[.\\- ]${dd}`),
+            // DD.MM.YYYY, DD-MM-YYYY, DD MM YYYY
+            new RegExp(`${dd}[.\\- ]${mm}[.\\- ]${year}`),
+            // YYMMDD
+            new RegExp(`${yy}${mm}${dd}`),
+            // DDMMYYYY
+            new RegExp(`${dd}${mm}${year}`)
+        ];
+
+        const haystack = titleText || '';
+        return patterns.some(re => re.test(haystack));
+    }
+
+    function highlightField(fieldObject){
+        fieldObject.style.backgroundColor = HIGHLIGHT_COLOR; // Teal
+        fieldObject.style.color = '#FFFFFF';
+        const anchorTag = fieldObject.querySelector('a');
+        if (anchorTag) {
+            anchorTag.style.color = '#FFFFFF'; // Change anchor text color to white
+        }
+    }
+
+    // Highlight fields that were verified from the filename.
+    // Uses the same visible style as Stash's "optional-field-content" matched block.
+    function highlightVerifiedMatch(fieldObject) {
+        if (!fieldObject) return;
+
+        fieldObject.style.backgroundColor = VERIFIED_MATCH_BACKGROUND_COLOR;
+        fieldObject.style.color = '#FFFFFF';
+        fieldObject.style.borderRadius = '0.25rem';
+        fieldObject.style.padding = '0.15rem 0.35rem';
+
+        fieldObject.querySelectorAll('a').forEach(anchorTag => {
+            anchorTag.style.color = '#FFFFFF';
+        });
+    }
+
+
+    function highlightNearDateMatch(fieldObject) {
+        if (!fieldObject) return;
+
+        fieldObject.style.backgroundColor = NEAR_DATE_MATCH_BACKGROUND_COLOR;
+        fieldObject.style.color = '#FFFFFF';
+        fieldObject.style.borderRadius = '0.25rem';
+        fieldObject.style.padding = '0.15rem 0.35rem';
+        fieldObject.title = 'Date is within 1 day of filename date';
+
+        fieldObject.querySelectorAll('a').forEach(anchorTag => {
+            anchorTag.style.color = '#FFFFFF';
+        });
+    }
+
+    function highlightDateFieldByStatus(fieldObject, matchStatus) {
+        if (matchStatus === 'exact') {
+            highlightVerifiedMatch(fieldObject);
+            addVerifiedIcon(fieldObject, 'Exact date match in filename');
+        } else if (matchStatus === 'near') {
+            highlightNearDateMatch(fieldObject);
+        } else if (matchStatus === 'partial' || matchStatus === 'year') {
+            highlightField(fieldObject);
+        }
+    }
+
+    // Append a verified icon to the given field if not already present.
+    // Optional tooltipText allows different explanations (date vs entity match).
+    // We wrap the SVG in a small div so the hover target for the tooltip is larger
+    // and easier to hit with the mouse.
+    function addVerifiedIcon(fieldObject, tooltipText) {
+        if (!fieldObject) return;
+        // Avoid adding multiple icons
+        if (fieldObject.querySelector('.SceneTaggerIcon')) {
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.style.display = 'inline-block';
+        container.style.marginLeft = '0.35rem';
+        container.title = tooltipText || 'Verified match with filename';
+
+        container.innerHTML = VERIFIED_ICON_SVG;
+        fieldObject.appendChild(container);
+    }
+
+    function multiHighlight(fieldObj, targetText)
+    {
+
+        const fieldText = fieldObj.textContent.trim().toLowerCase();
+        const target = targetText.trim().toLowerCase();
+        const fieldWords = fieldText.split(/\s+/); //split whitespace
+        let matchCount = 0;
+
+        fieldWords.forEach(word => {
+           if (target.includes(word)) {
+               matchCount++;
+           }
+        });
+
+        const matchPercentage = (matchCount / fieldWords.length) * 100;
+        const opacity = Math.min(matchPercentage, 100); // Limit opacity to 100%
+
+        // Apply the highlight with calculated opacity
+        fieldObj.style.backgroundColor = `rgba(${parseInt(HIGHLIGHT_COLOR.slice(1, 3), 16)}, ${parseInt(HIGHLIGHT_COLOR.slice(3, 5), 16)}, ${parseInt(HIGHLIGHT_COLOR.slice(5, 7), 16)}, ${opacity / 100})`;
+        fieldObj.style.color = '#FFFFFF'; // White text
+    }
+
+    function applyVerifiedSpanStyle(span) {
+        span.style.backgroundColor = VERIFIED_MATCH_BACKGROUND_COLOR;
+        span.style.color = '#FFFFFF';
+        span.style.borderRadius = '0.25rem';
+        span.style.padding = '0.15rem 0.35rem';
+        span.style.display = 'inline-block';
+    }
+
+
+    function applyNearDateSpanStyle(span) {
+        span.style.backgroundColor = NEAR_DATE_MATCH_BACKGROUND_COLOR;
+        span.style.color = '#FFFFFF';
+        span.style.borderRadius = '0.25rem';
+        span.style.padding = '0.15rem 0.35rem';
+        span.style.display = 'inline-block';
+    }
+
+    function applyDateSpanStyle(span, matchStatus) {
+        if (matchStatus === 'exact' || matchStatus === 'partial' || matchStatus === 'year') {
+            applyVerifiedSpanStyle(span);
+        } else if (matchStatus === 'near') {
+            applyNearDateSpanStyle(span);
+        }
+    }
+
+    function createTextSpan(text, isMatched, tooltipText, matchStatus) {
+        const span = document.createElement('span');
+        span.textContent = text;
+        if (isMatched) {
+            if (matchStatus) {
+                applyDateSpanStyle(span, matchStatus);
+            } else {
+                applyVerifiedSpanStyle(span);
+            }
+            if (tooltipText) {
+                span.title = tooltipText;
+            }
+        }
+        return span;
+    }
+
+    function getSceneMetadataParts(text) {
+        const dateMatch = (text || '').match(/\b\d{4}-\d{2}-\d{2}\b/);
+        if (!dateMatch) {
+            return {
+                textPart: (text || '').trim(),
+                separatorPart: '',
+                datePart: ''
+            };
+        }
+
+        const datePart = dateMatch[0];
+        const beforeDate = text.slice(0, dateMatch.index);
+        const afterDate = text.slice(dateMatch.index + datePart.length);
+
+        // The usual form is "Studio • YYYY-MM-DD". Keep the separator unhighlighted
+        // so studio/site and date can show independent match states.
+        const separatorMatch = beforeDate.match(/\s*[•|\-–—]\s*$/);
+        const separatorPart = separatorMatch ? separatorMatch[0] : '';
+        const textPart = beforeDate.slice(0, beforeDate.length - separatorPart.length).trim();
+
+        return {
+            textPart,
+            separatorPart,
+            datePart,
+            afterDate
+        };
+    }
+
+    function clearSceneMetadataContainerHighlight(field) {
+        // Older versions highlighted the whole h5. Newer versions highlight only
+        // the matched sub-parts, so clear our old container-level inline style.
+        field.style.backgroundColor = '';
+        field.style.color = '';
+        field.style.borderRadius = '';
+        field.style.padding = '';
+    }
+
+    // Highlight metadata rendered as a compact header, for example:
+    // <div class="scene-metadata"><h5>Tiny 4K • 2014-10-14</h5></div>
+    // Studio/site text and date are evaluated independently. This prevents a line
+    // like "Tiny 4K • 2014-10-14" from being highlighted as one whole block when
+    // only the alias "t4k" matches the filename/query.
+    function highlightSceneMetadataDates(searchItem, sourceText) {
+        const metadataFields = searchItem.querySelectorAll('.scene-metadata h5');
+
+        metadataFields.forEach(field => {
+            clearSceneMetadataContainerHighlight(field);
+
+            // If Stash rendered a real optional-field inside h5, leave that component
+            // alone. It is already handled by the optional-field-content code path.
+            if (field.querySelector('.optional-field')) return;
+
+            if (!field.dataset.dmhOriginalText) {
+                field.dataset.dmhOriginalText = field.textContent || '';
+            }
+
+            const originalText = field.dataset.dmhOriginalText;
+            const parts = getSceneMetadataParts(originalText);
+            const textMatched = !!parts.textPart && isTextMatchedBySource(parts.textPart, sourceText);
+            const dateMatchStatus = parts.datePart ? getDateMatchStatus(parts.datePart, sourceText) : 'none';
+            const dateMatched = dateMatchStatus !== 'none';
+
+            const signature = [originalText, sourceText, textMatched ? 'T1' : 'T0', `D:${dateMatchStatus}`].join('::');
+            if (field.dataset.dmhSceneMetadataSignature === signature) return;
+            field.dataset.dmhSceneMetadataSignature = signature;
+
+            field.textContent = '';
+
+            if (parts.textPart) {
+                field.appendChild(createTextSpan(
+                    parts.textPart,
+                    textMatched,
+                    textMatched ? 'Text/studio found in filename or alias dictionary' : ''
+                ));
+            }
+
+            if (parts.separatorPart) {
+                field.appendChild(document.createTextNode(parts.separatorPart));
+            } else if (parts.textPart && parts.datePart) {
+                field.appendChild(document.createTextNode(' '));
+            }
+
+            if (parts.datePart) {
+                const dateSpan = createTextSpan(
+                    parts.datePart,
+                    dateMatched,
+                    dateMatchStatus === 'near'
+                        ? 'Date is within 1 day of filename date'
+                        : (dateMatched ? 'Date match in filename' : ''),
+                    dateMatchStatus
+                );
+                field.appendChild(dateSpan);
+            }
+
+            if (parts.afterDate) {
+                field.appendChild(document.createTextNode(parts.afterDate));
+            }
+        });
+    }
+
+    // Highlight fingerprint ratio lines by generic "X/Y" pattern only.
+    // This is language-independent and does not rewrite DOM/text nodes,
+    // so it is safe to run from MutationObserver without causing update loops.
+    function highlightFingerprints() {
+        const matchDivs = document.querySelectorAll('div.font-weight-bold');
+
+        matchDivs.forEach(div => {
+            const text = div.textContent || '';
+            const match = text.match(/(\d+)\s*\/\s*(\d+)/);
+            if (!match) return;
+
+            const matched = parseInt(match[1], 10);
+            const total = parseInt(match[2], 10);
+            if (!Number.isFinite(matched) || !Number.isFinite(total) || total <= 0) return;
+
+            const percent = matched / total;
+            const color = getFingerprintColor(total, percent);
+            if (!color) return;
+
+            div.style.backgroundColor = color;
+            div.style.color = '#FFFFFF';
+            div.style.borderRadius = '0.25rem';
+            div.style.padding = '0.15rem 0.35rem';
+        });
+    }
+
+
+    // Normalize text for lightweight filename/entity comparisons.
+    function normalizeForCompare(value) {
+        return (value || '')
+            .toLowerCase()
+            .replace(/'/g, '')
+            .trim();
+    }
+
+    // Stronger normalization for comparing StashBox entity names with local Stash
+    // matched names. This ignores punctuation like !, dots, hyphens, underscores
+    // and multiple spaces, so "Not My Grandpa!" and "Not My Grandpa" match.
+    function normalizeForLooseCompare(value) {
+        return normalizeForCompare(value)
+            .normalize('NFKD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^\p{L}\p{N}]+/gu, '');
+    }
+
+    function getAliasGroupValues(value) {
+        const valueLoose = normalizeForLooseCompare(value);
+        if (!valueLoose) return [];
+
+        const aliases = new Set();
+        MATCH_ALIAS_GROUPS.forEach(group => {
+            const groupLooseValues = group.map(item => normalizeForLooseCompare(item)).filter(Boolean);
+            if (groupLooseValues.includes(valueLoose)) {
+                group.forEach(item => {
+                    if (item) aliases.add(item);
+                });
+            }
+        });
+
+        return Array.from(aliases);
+    }
+
+    function buildTextMatchCandidates(value) {
+        const normalizedValue = normalizeForCompare(value);
+        const values = [normalizedValue, ...getAliasGroupValues(normalizedValue)];
+        const candidates = new Set();
+
+        values.forEach(item => {
+            const normalizedItem = normalizeForCompare(item);
+            const looseItem = normalizeForLooseCompare(item);
+            if (!normalizedItem && !looseItem) return;
+
+            if (normalizedItem) {
+                candidates.add(normalizedItem);
+                candidates.add(normalizedItem.replace(/\s+/g, ''));
+                candidates.add(normalizedItem.replace(/\s+/g, '.'));
+                candidates.add(normalizedItem.replace(/\s+/g, '_'));
+                candidates.add(normalizedItem.replace(/\s+/g, '-'));
+            }
+
+            if (looseItem) {
+                candidates.add(looseItem);
+            }
+        });
+
+        return Array.from(candidates).filter(Boolean);
+    }
+
+    function areNamesEquivalent(left, right) {
+        const leftLoose = normalizeForLooseCompare(left);
+        const rightLoose = normalizeForLooseCompare(right);
+        return !!leftLoose && !!rightLoose && leftLoose === rightLoose;
+    }
+
+    function isTextMatchedBySource(value, sourceText) {
+        const normalizedSource = normalizeForCompare(sourceText);
+        if (!value || !normalizedSource) return false;
+
+        const candidates = buildTextMatchCandidates(value);
+        if (candidates.length === 0) return false;
+
+        const looseSource = normalizeForLooseCompare(normalizedSource);
+        return candidates.some(candidate =>
+            candidate && (normalizedSource.includes(candidate) || looseSource.includes(candidate))
+        );
+    }
+
+    function getEntityFieldValue(field) {
+        if (!field) return '';
+
+        const anchor = field.querySelector('b a, b span a, a');
+        const anchorText = anchor && anchor.textContent ? anchor.textContent.trim() : '';
+        if (anchorText) {
+            return anchorText.replace(/\s*\(.*?\)\s*$/, '').trim();
+        }
+
+        const parts = (field.textContent || '').split(':');
+        if (parts.length < 2) return '';
+
+        return parts.slice(1).join(':').replace(/\s*\(.*?\)\s*$/, '').trim();
+    }
+
+    function getEntityMatchLabel(field) {
+        const text = field && field.textContent ? field.textContent : '';
+        return text.includes(':') ? text.split(':')[0].trim() : 'Entity';
+    }
+
+    function isLocalMatchedText(value) {
+        return /^\s*(Matched|Совпавший)\s*:/i.test(value || '');
+    }
+
+    function getBackgroundAlpha(element) {
+        if (!element) return 0;
+
+        const backgroundColor = (
+            element.style.backgroundColor ||
+            window.getComputedStyle(element).backgroundColor ||
+            ''
+        ).trim().toLowerCase();
+
+        if (!backgroundColor || backgroundColor === 'transparent') return 0;
+
+        const rgbaMatch = backgroundColor.match(/^rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([0-9.]+)\s*\)$/);
+        if (rgbaMatch) {
+            const alpha = parseFloat(rgbaMatch[1]);
+            return Number.isFinite(alpha) ? alpha : 0;
+        }
+
+        const rgbMatch = backgroundColor.match(/^rgb\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\)$/);
+        return rgbMatch ? 1 : 0;
+    }
+
+    function isVisiblyHighlightedField(element) {
+        // Treat rgba(..., 0) as NOT highlighted. This prevents local "Совпавший"
+        // blocks with transparent background from verifying the entity name.
+        return getBackgroundAlpha(element) > 0.05;
+    }
+
+    function getLocalMatchedValuesNearEntity(field) {
+        const row = field.closest('.row');
+        const scope = row || field.closest('li.search-result') || field.parentElement;
+        if (!scope) return [];
+
+        return Array.from(scope.querySelectorAll('.optional-field.included .optional-field-content'))
+            .filter(optionalField => !optionalField.closest('.scene-image-container'))
+            .filter(optionalField => isVisiblyHighlightedField(optionalField))
+            .map(optionalField => {
+                const anchor = optionalField.querySelector('a');
+                if (anchor && anchor.textContent) {
+                    return anchor.textContent.trim();
+                }
+
+                return (optionalField.textContent || '')
+                    .replace(/^\s*(Matched|Совпавший)\s*:\s*/i, '')
+                    .trim();
+            })
+            .filter(Boolean);
+    }
+
+    function isEntityMatchedLocally(field, entityValue) {
+        if (!entityValue) return false;
+
+        return getLocalMatchedValuesNearEntity(field).some(localValue =>
+            areNamesEquivalent(entityValue, localValue)
+        );
+    }
+
+    function countEntityMatches(result, sourceText) {
+        let score = 0;
+
+        result.querySelectorAll('.entity-name').forEach(field => {
+            const entityValue = getEntityFieldValue(field);
+            if (!entityValue) return;
+
+            if (isTextMatchedBySource(entityValue, sourceText)) {
+                score += 2;
+            }
+
+            // Local Stash match is also a strong signal. It covers cases where the
+            // filename does not contain the studio/performer name, but Stash already
+            // rendered "Matched/Совпавший" with the same name next to the entity.
+            if (isEntityMatchedLocally(field, entityValue)) {
+                score += 2;
+            }
+        });
+
+        return score;
+    }
+
+    function countOptionalFieldMatches(result, sourceText) {
+        let score = 0;
+
+        result.querySelectorAll('.optional-field.included .optional-field-content').forEach(field => {
+            // The preview image is usually present in every result, so it is not useful
+            // for deciding which metadata tab/result is the best match.
+            if (field.closest('.scene-image-container')) return;
+
+            const value = (field.textContent || '').trim();
+            if (!value) return;
+
+            if (isLocalMatchedText(value)) {
+                // A local Stash match should influence scoring only when it is visibly
+                // highlighted by Stash/our previous checks. Transparent rgba(..., 0)
+                // means there was no real filename/query match.
+                if (isVisiblyHighlightedField(field)) {
+                    score += 1;
+                }
+                return;
+            }
+
+            const isoDateMatch = value.match(/^\d{4}-\d{2}-\d{2}$/);
+            if (isoDateMatch) {
+                const dateMatchStatus = getDateMatchStatus(value, sourceText);
+                if (dateMatchStatus === 'exact') {
+                    score += 3;
+                } else if (dateMatchStatus === 'near') {
+                    score += 2.5;
+                } else if (dateMatchStatus === 'partial') {
+                    score += 2;
+                } else if (dateMatchStatus === 'year') {
+                    score += 1.5;
+                } else {
+                    score += 1;
+                }
+                return;
+            }
+
+            if (isTextMatchedBySource(value, sourceText)) {
+                score += 2;
+                return;
+            }
+
+            // Stash's included optional-field still means the scraper selected this field.
+            // Give it a small score even if it is not directly found in the filename.
+            score += 1;
+        });
+
+        return score;
+    }
+
+    function countSceneMetadataDateMatches(result, sourceText) {
+        let score = 0;
+
+        result.querySelectorAll('.scene-metadata h5').forEach(field => {
+            const text = field.dataset.dmhOriginalText || field.textContent || '';
+            const parts = getSceneMetadataParts(text);
+
+            if (parts.textPart && isTextMatchedBySource(parts.textPart, sourceText)) {
+                score += 2;
+            }
+
+            if (parts.datePart) {
+                const dateMatchStatus = getDateMatchStatus(parts.datePart, sourceText);
+                if (dateMatchStatus === 'exact') {
+                    score += 3;
+                } else if (dateMatchStatus === 'near') {
+                    score += 2.5;
+                } else if (dateMatchStatus === 'partial') {
+                    score += 2;
+                } else if (dateMatchStatus === 'year') {
+                    score += 1.5;
+                }
+            }
+        });
+
+        return score;
+    }
+
+    function countFingerprintAndChecksumMatches(result) {
+        let score = 0;
+
+        result.querySelectorAll('div.font-weight-bold').forEach(div => {
+            const text = div.textContent || '';
+            const ratioMatch = text.match(/(\d+)\s*\/\s*(\d+)/);
+
+            if (ratioMatch) {
+                const matched = parseInt(ratioMatch[1], 10);
+                const total = parseInt(ratioMatch[2], 10);
+
+                if (Number.isFinite(matched) && Number.isFinite(total) && total > 0) {
+                    const percent = Math.max(0, Math.min(1, matched / total));
+                    // Ratio is the strongest single indicator, but keep the score bounded.
+                    score += percent * 6;
+                    score += Math.min(matched, 100) / 100;
+                    if (matched === total) score += 1;
+                }
+                return;
+            }
+
+            const hasSuccessIcon = div.querySelector('.SceneTaggerIcon.text-success, .text-success, svg[color="#0f9960"]');
+            const hasDangerIcon = div.querySelector('.text-danger, [data-icon="xmark"]');
+
+            if (hasSuccessIcon) score += 1.5;
+            if (hasDangerIcon) score -= 1;
+        });
+
+        return score;
+    }
+
+    function getSearchResultScore(result, sourceText) {
+        let score = 0;
+
+        score += countOptionalFieldMatches(result, sourceText);
+        score += countEntityMatches(result, sourceText);
+        score += countSceneMetadataDateMatches(result, sourceText);
+        score += countFingerprintAndChecksumMatches(result);
+
+        return score;
+    }
+
+    function getResultActivationSignature(searchResults) {
+        return searchResults.map(result => result.className).join('|');
+    }
+
+    // Select/expand the best search-result inside each search-item.
+    // We click the best result instead of moving DOM nodes, because Stash/React owns the list.
+    function activateBestSearchResult(searchItem, sourceText) {
+        const searchResults = Array.from(searchItem.querySelectorAll('li.search-result'));
+        if (searchResults.length < 2) return;
+
+        const scored = searchResults.map((result, index) => ({
+            result,
+            index,
+            score: getSearchResultScore(result, sourceText)
+        }));
+
+        scored.sort((a, b) => {
+            if (b.score !== a.score) return b.score - a.score;
+            return a.index - b.index;
+        });
+
+        const best = scored[0];
+        if (!best || best.score <= 0) return;
+
+        const currentlyActive = searchResults.find(result =>
+            result.classList.contains('active') || result.classList.contains('selected-result')
+        );
+
+        if (currentlyActive === best.result) return;
+
+        const scoreSignature = scored
+            .map(item => `${item.index}:${Math.round(item.score * 100)}`)
+            .join('|');
+        const activationSignature = getResultActivationSignature(searchResults);
+        const signature = `${scoreSignature}::${activationSignature}`;
+        const now = Date.now();
+        const lastSignature = searchItem.dataset.dmhBestResultActivationSignature || '';
+        const lastClickTime = parseInt(searchItem.dataset.dmhBestResultActivationTime || '0', 10);
+
+        // If Stash does not activate the result for some reason, do not click in a tight loop.
+        if (lastSignature === signature && now - lastClickTime < 1500) return;
+
+        searchItem.dataset.dmhBestResultActivationSignature = signature;
+        searchItem.dataset.dmhBestResultActivationTime = String(now);
+
+        best.result.dispatchEvent(new MouseEvent('click', {
+            bubbles: true,
+            cancelable: true,
+            view: window
+        }));
+    }
+
+    function getSearchItemSourceText(searchItem) {
+        if (!searchItem) return '';
+
+        let sourceText = '';
+        const sourceLink = searchItem.querySelector('a.scene-link.overflow-hidden');
+        if (sourceLink && sourceLink.textContent) {
+            sourceText = sourceLink.textContent.trim();
+        }
+
+        const queryInput = searchItem.querySelector('input.text-input.form-control, input.text-input');
+        if (queryInput && typeof queryInput.value === 'string') {
+            const queryText = queryInput.value.trim();
+            if (queryText) {
+                sourceText = (sourceText + ' ' + queryText).trim();
+            }
+        }
+
+        return sourceText;
+    }
+
+    // Function to highlight the date/field/entity matches
+    function highlightMatches() {
+        let rowcount=0;
+        const searchItems = document.querySelectorAll('div.search-item'); // Get all search-item divs
+        searchItems.forEach(searchItem => {
+            rowcount++
+            // Get potential fields (optional-field-content) inside the search-item
+            let resultFields = searchItem.querySelectorAll('.optional-field-content');
+
+            // Build the "source" text from the TOP of the card only:
+            // [a.scene-link.overflow-hidden] + [text-input form-control].
+            // This is the query/filename we want to validate the LOWER metadata against.
+            const sourceText = getSearchItemSourceText(searchItem);
+
+            // Debug: show the source string we use as the haystack (top block only)
+            //console.log('[DataMatchHighlighter] sourceText:', sourceText);
+
+            // Loop through the date fields and find and highlight the matches
+            resultFields.forEach(field => {
+                let matchText = field.textContent.trim();
+
+                // Don't process local Stash matched blocks or empty elements.
+                // These blocks look like "Matched:" / "Совпавший:" and should not be
+                // colored by partial filename matching, especially not with rgba(..., 0).
+                if (matchText === "" || isLocalMatchedText(matchText)) {
+                    return; // Skip to the next iteration
+                }
+
+                let isoDateMatch = field.textContent.match(/^\d{4}-\d{2}-\d{2}$/); // Check for ISO date format (YYYY-MM-DD)
+                if (isoDateMatch) {
+                    // For dates, we ONLY compare against the top "sourceText" (filename + query).
+                    // No self-match is possible because the result date lives in the lower card.
+                    // Exact matches are green; +/- 1 day matches are orange; weaker partial/year
+                    // matches keep the old green behaviour from 1.19.x.
+                    const dateMatchStatus = getDateMatchStatus(matchText, sourceText);
+                    highlightDateFieldByStatus(field, dateMatchStatus);
+                } else {
+                    if (sourceText.includes(matchText))
+                    {
+                        // Highlight the date field in green and change the text color to white
+                        highlightField(field);
+                    }
+                    else
+                    {
+                        multiHighlight(field, sourceText);
+                    }
+                }
+            });
+
+            // Also handle dates that Stash renders inside scene metadata headers.
+            highlightSceneMetadataDates(searchItem, sourceText);
+
+            // Get the entities, loop through and add verified icon when matched.
+            // An entity can be verified either from filename/query OR from the local
+            // "Matched/Совпавший" optional field rendered in the same row.
+            let entityFields = searchItem.querySelectorAll('.entity-name');
+            entityFields.forEach(obfield => {
+                const entityValue = getEntityFieldValue(obfield);
+                if (!entityValue) return;
+
+                const matchLabel = getEntityMatchLabel(obfield);
+                const matchedBySource = isTextMatchedBySource(entityValue, sourceText);
+                const matchedLocally = isEntityMatchedLocally(obfield, entityValue);
+
+                if (matchedBySource || matchedLocally) {
+                    highlightVerifiedMatch(obfield);
+                    addVerifiedIcon(
+                        obfield,
+                        matchedBySource
+                            ? `${matchLabel} found in filename`
+                            : `${matchLabel} matches local Stash item`
+                    );
+                }
+            });
+
+            // If several scraper result tabs are present, open the one with the strongest match score.
+            activateBestSearchResult(searchItem, sourceText);
+        });
+    }
+
+    function isElementVisible(element) {
+        if (!element) return false;
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => window.setTimeout(resolve, ms));
+    }
+
+    function getScrollableParent(element) {
+        let current = element ? element.parentElement : null;
+
+        while (current && current !== document.body && current !== document.documentElement) {
+            const style = window.getComputedStyle(current);
+            const overflowY = `${style.overflowY} ${style.overflow}`;
+            const canScroll = /(auto|scroll|overlay)/i.test(overflowY) && current.scrollHeight > current.clientHeight + 1;
+            if (canScroll) return current;
+            current = current.parentElement;
+        }
+
+        return window;
+    }
+
+    function dispatchScrollWakeEvents(searchItem) {
+        try {
+            const scrollParent = getScrollableParent(searchItem);
+
+            if (scrollParent && scrollParent !== window) {
+                scrollParent.dispatchEvent(new Event('scroll', { bubbles: true }));
+            }
+
+            window.dispatchEvent(new Event('scroll'));
+            window.dispatchEvent(new Event('resize'));
+        } catch (error) {
+            console.warn('[DataMatchHighlighter] Failed to dispatch scroll wake events:', error);
+        }
+    }
+
+    function scrollSearchItemIntoView(searchItem) {
+        if (!ENABLE_SCRAPE_ITEM_SCROLL_WAKE || !searchItem || !document.body.contains(searchItem)) return;
+
+        try {
+            searchItem.scrollIntoView({
+                block: 'center',
+                inline: 'nearest',
+                behavior: 'instant'
+            });
+        } catch (error) {
+            try {
+                searchItem.scrollIntoView(false);
+            } catch (fallbackError) {
+                console.warn('[DataMatchHighlighter] Failed to scroll scrape item into view:', fallbackError);
+            }
+        }
+
+        dispatchScrollWakeEvents(searchItem);
+    }
+
+    async function wakeSearchItemRendering(searchItem) {
+        scrollSearchItemIntoView(searchItem);
+
+        if (SCRAPE_ITEM_SCROLL_WAKE_SETTLE_MS > 0) {
+            await sleep(SCRAPE_ITEM_SCROLL_WAKE_SETTLE_MS);
+        }
+
+        runAllHighlights();
+    }
+
+    function normalizeScrapeButtonText(button) {
+        return (button?.textContent || '')
+            .replace(/\s+/g, ' ')
+            .replace(/^(Загрузка…|Загрузка\.\.\.|Loading…|Loading\.\.\.)\s*/i, '')
+            .trim();
+    }
+
+    function isScrapeByFragmentButton(button) {
+        if (!button || button.dataset.dmhScrapeAllButton === 'true') return false;
+        const buttonText = normalizeScrapeButtonText(button);
+        return SCRAPE_BY_FRAGMENT_BUTTON_TEXTS.some(expectedText =>
+            buttonText === expectedText || buttonText.endsWith(expectedText)
+        );
+    }
+
+    function isLoadingScrapeByFragmentButton(button) {
+        if (!button || button.dataset.dmhScrapeAllButton === 'true') return false;
+
+        const hasLoadingIndicator = !!button.querySelector('.LoadingIndicator.inline.small, .LoadingIndicator, .spinner-border');
+        if (!hasLoadingIndicator) return false;
+
+        const rawText = (button.textContent || '').replace(/\s+/g, ' ').trim();
+        return SCRAPE_BY_FRAGMENT_BUTTON_TEXTS.some(expectedText => rawText.includes(expectedText));
+    }
+
+    function getLoadingScrapeByFragmentButtons() {
+        return Array.from(document.querySelectorAll('button.btn.btn-primary'))
+            .filter(isLoadingScrapeByFragmentButton)
+            .filter(isElementVisible);
+    }
+
+    function hasActiveScrapeByFragmentLoading() {
+        return getLoadingScrapeByFragmentButtons().length > 0;
+    }
+
+    async function waitForActiveScrapeByFragmentLoadingToFinish(triggerButton, contextText) {
+        const startedAt = Date.now();
+        let lastStatusAt = 0;
+        let lastScrollWakeAt = 0;
+
+        while (hasActiveScrapeByFragmentLoading()) {
+            const now = Date.now();
+
+            if (now - lastStatusAt >= SCRAPE_ACTIVE_LOADING_STATUS_INTERVAL_MS) {
+                lastStatusAt = now;
+                const seconds = Math.round((now - startedAt) / 1000);
+                const label = contextText ? `${contextText} / ` : '';
+                setScrapeAllButtonState(triggerButton, `Жду Stash ${seconds}с`, true);
+                setScrapeProgressCounterState(`DMH: ${label}Stash ещё скрейпит фрагмент (${seconds}с), переход запрещён`, 'running');
+            }
+
+            if (ENABLE_SCRAPE_ITEM_SCROLL_WAKE && now - lastScrollWakeAt >= SCRAPE_WAIT_SCROLL_WAKE_INTERVAL_MS) {
+                lastScrollWakeAt = now;
+                const loadingButton = getLoadingScrapeByFragmentButtons()[0];
+                scrollSearchItemIntoView(loadingButton?.closest('div.search-item') || document.body);
+            }
+
+            if (SCRAPE_ACTIVE_LOADING_MAX_WAIT_MS > 0 && now - startedAt >= SCRAPE_ACTIVE_LOADING_MAX_WAIT_MS) {
+                setScrapeProgressCounterState('DMH: Stash слишком долго скрейпит фрагмент / остановлен', 'warning');
+                return false;
+            }
+
+            await sleep(SCRAPE_ACTIVE_LOADING_POLL_INTERVAL_MS);
+        }
+
+        return true;
+    }
+
+    function getScrapeByFragmentButtons() {
+        return Array.from(document.querySelectorAll('button.btn.btn-primary'))
+            .filter(isScrapeByFragmentButton)
+            .filter(button => !button.disabled)
+            .filter(isElementVisible);
+    }
+
+    function getAllScrapeByFragmentButtons() {
+        return Array.from(document.querySelectorAll('button.btn.btn-primary'))
+            .filter(isScrapeByFragmentButton)
+            .filter(isElementVisible);
+    }
+
+    function getActionableScrapeByFragmentTasks() {
+        return getScrapeByFragmentButtons()
+            .map(button => ({
+                button,
+                searchItem: button.closest('div.search-item')
+            }))
+            .filter(task => task.searchItem)
+            .filter(task => !isSearchItemRememberedAsNoAutoMatch(task.searchItem));
+    }
+
+    function getCurrentScrapeButtonForSearchItem(searchItem, fallbackButton) {
+        if (fallbackButton && document.body.contains(fallbackButton)) {
+            return fallbackButton;
+        }
+
+        if (!searchItem || !document.body.contains(searchItem)) return null;
+
+        return Array.from(searchItem.querySelectorAll('button.btn.btn-primary'))
+            .find(isScrapeByFragmentButton) || null;
+    }
+
+    function getSearchItemFileName(searchItem) {
+        if (!searchItem) return '';
+
+        const fileNameElement = searchItem.querySelector(
+            'a.scene-link.overflow-hidden .TruncatedText, a.scene-link.overflow-hidden'
+        );
+
+        return (fileNameElement ? fileNameElement.textContent : '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function normalizeSessionMemoryFileName(fileName) {
+        return (fileName || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    function readNoAutoMatchMemorySet() {
+        if (!ENABLE_SCRAPE_SESSION_MEMORY_FOR_NO_AUTO_MATCH) return new Set();
+
+        try {
+            const raw = window.sessionStorage.getItem(SCRAPE_SESSION_MEMORY_KEY);
+            const values = raw ? JSON.parse(raw) : [];
+            if (!Array.isArray(values)) return new Set();
+            return new Set(values.filter(value => typeof value === 'string' && value.length > 0));
+        } catch (error) {
+            console.warn('[DataMatchHighlighter] Failed to read scrape session memory:', error);
+            return new Set();
+        }
+    }
+
+    function writeNoAutoMatchMemorySet(memorySet) {
+        if (!ENABLE_SCRAPE_SESSION_MEMORY_FOR_NO_AUTO_MATCH) return;
+
+        try {
+            window.sessionStorage.setItem(
+                SCRAPE_SESSION_MEMORY_KEY,
+                JSON.stringify(Array.from(memorySet).sort())
+            );
+        } catch (error) {
+            console.warn('[DataMatchHighlighter] Failed to write scrape session memory:', error);
+        }
+    }
+
+    function clearNoAutoMatchMemorySet() {
+        if (!ENABLE_SCRAPE_SESSION_MEMORY_FOR_NO_AUTO_MATCH) return 0;
+
+        const previousSize = readNoAutoMatchMemorySet().size;
+
+        try {
+            window.sessionStorage.removeItem(SCRAPE_SESSION_MEMORY_KEY);
+        } catch (error) {
+            console.warn('[DataMatchHighlighter] Failed to clear scrape session memory:', error);
+        }
+
+        document.querySelectorAll('[data-dmh-scrape-no-auto-match-file]').forEach(searchItem => {
+            delete searchItem.dataset.dmhScrapeNoAutoMatchReason;
+            delete searchItem.dataset.dmhScrapeNoAutoMatchFile;
+        });
+
+        return previousSize;
+    }
+
+    function isSearchItemRememberedAsNoAutoMatch(searchItem) {
+        if (!ENABLE_SCRAPE_SESSION_MEMORY_FOR_NO_AUTO_MATCH) return false;
+
+        const fileNameKey = normalizeSessionMemoryFileName(getSearchItemFileName(searchItem));
+        if (!fileNameKey) return false;
+
+        return readNoAutoMatchMemorySet().has(fileNameKey);
+    }
+
+    function rememberSearchItemAsNoAutoMatch(searchItem, reason) {
+        if (!ENABLE_SCRAPE_SESSION_MEMORY_FOR_NO_AUTO_MATCH || !searchItem) return false;
+
+        const fileName = getSearchItemFileName(searchItem);
+        const fileNameKey = normalizeSessionMemoryFileName(fileName);
+        if (!fileNameKey) return false;
+
+        const memorySet = readNoAutoMatchMemorySet();
+        if (memorySet.has(fileNameKey)) return false;
+
+        memorySet.add(fileNameKey);
+        writeNoAutoMatchMemorySet(memorySet);
+
+        searchItem.dataset.dmhScrapeNoAutoMatchRemembered = 'true';
+        searchItem.dataset.dmhScrapeNoAutoMatchReason = reason || 'no-auto-save';
+        searchItem.dataset.dmhScrapeNoAutoMatchFile = fileName;
+
+        return true;
+    }
+
+    function getComparisonDataSignature(searchItem) {
+        if (!searchItem) return '';
+
+        const resultCount = searchItem.querySelectorAll('li.search-result').length;
+        const relevantText = Array.from(searchItem.querySelectorAll(
+            'li.search-result .scene-metadata, li.search-result .optional-field-content, li.search-result .entity-name, li.search-result div.font-weight-bold'
+        ))
+            .map(element => (element.textContent || '').replace(/\s+/g, ' ').trim())
+            .filter(Boolean)
+            .join(' || ')
+            .slice(0, 10000);
+
+        return `${resultCount}::${relevantText}`;
+    }
+
+    function hasComparisonData(searchItem) {
+        if (!searchItem) return false;
+
+        return Array.from(searchItem.querySelectorAll('li.search-result')).some(result => {
+            if (result.querySelector('.entity-name')) return true;
+            if (result.querySelector('.scene-metadata')) return true;
+
+            const hasUsefulOptionalText = Array.from(result.querySelectorAll('.optional-field-content'))
+                .some(field => {
+                    if (field.closest('.scene-image-container')) return false;
+                    const text = (field.textContent || '').replace(/\s+/g, ' ').trim();
+                    return text.length > 0;
+                });
+            if (hasUsefulOptionalText) return true;
+
+            return Array.from(result.querySelectorAll('div.font-weight-bold'))
+                .some(div => /\d+\s*\/\s*\d+|PHash|MD5|ПХэш|ПHash|Checksum|контрольн/i.test(div.textContent || ''));
+        });
+    }
+
+
+    function hasNoScrapeResults(searchItem) {
+        if (!searchItem) return false;
+
+        return Array.from(searchItem.querySelectorAll('.text-danger.font-weight-bold, .text-danger'))
+            .some(element => {
+                const text = (element.textContent || '').replace(/\s+/g, ' ').trim();
+                return /ничего\s+не\s+найдено|nothing\s+found|no\s+results/i.test(text);
+            });
+    }
+
+    function getBestFingerprintInfo(result) {
+        let best = null;
+
+        if (!result) return null;
+
+        result.querySelectorAll('div.font-weight-bold').forEach(div => {
+            const text = div.textContent || '';
+            const ratioMatch = text.match(/(\d+)\s*\/\s*(\d+)/);
+            if (!ratioMatch) return;
+
+            const matched = parseInt(ratioMatch[1], 10);
+            const total = parseInt(ratioMatch[2], 10);
+            if (!Number.isFinite(matched) || !Number.isFinite(total) || total <= 0) return;
+
+            const percent = Math.max(0, Math.min(1, matched / total));
+            const info = { matched, total, percent, exact: matched === total };
+            if (!best || info.percent > best.percent || (info.percent === best.percent && info.matched > best.matched)) {
+                best = info;
+            }
+        });
+
+        return best;
+    }
+
+    function isStudioOrActorEntityField(field) {
+        const label = normalizeForCompare(getEntityMatchLabel(field));
+        return /студ|studio|акт[её]р|actor|performer/.test(label);
+    }
+
+    function getHighConfidenceFieldMatches(result, sourceText) {
+        const matches = new Set();
+        if (!result) return matches;
+
+        result.querySelectorAll('.entity-name').forEach(field => {
+            if (!isStudioOrActorEntityField(field)) return;
+
+            const entityValue = getEntityFieldValue(field);
+            if (!entityValue) return;
+
+            const label = normalizeForCompare(getEntityMatchLabel(field));
+            const isActor = /акт[её]р|actor|performer/.test(label);
+            const isStudio = /студ|studio/.test(label);
+
+            if (isTextMatchedBySource(entityValue, sourceText) || isEntityMatchedLocally(field, entityValue)) {
+                if (isActor) matches.add('actor');
+                if (isStudio) matches.add('studio');
+            }
+        });
+
+        result.querySelectorAll('.optional-field.included .optional-field-content').forEach(field => {
+            if (field.closest('.scene-image-container')) return;
+
+            const value = (field.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!value || isLocalMatchedText(value)) return;
+
+            if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+                const dateMatchStatus = getDateMatchStatus(value, sourceText);
+                if (dateMatchStatus !== 'none') matches.add('date');
+                return;
+            }
+
+            const isPotentialTitleField = !!field.closest('.scene-metadata h4, .scene-metadata h5');
+            if (isPotentialTitleField && isTextMatchedBySource(value, sourceText)) {
+                matches.add('title');
+            }
+        });
+
+        result.querySelectorAll('.scene-metadata h5').forEach(field => {
+            const text = field.dataset.dmhOriginalText || field.textContent || '';
+            const parts = getSceneMetadataParts(text);
+
+            if (parts.datePart && getDateMatchStatus(parts.datePart, sourceText) !== 'none') {
+                matches.add('date');
+            }
+
+            if (parts.textPart && isTextMatchedBySource(parts.textPart, sourceText)) {
+                // In Stash scene metadata this text is usually site/studio, but it can
+                // also be useful title-like metadata. Either way it is a meaningful field.
+                matches.add('title');
+            }
+        });
+
+        return matches;
+    }
+
+    function isAutoSaveHighConfidenceMatch(fingerprint, fields) {
+        if (!fingerprint || !fields) return false;
+
+        const fieldCount = fields.size || 0;
+        if (fieldCount <= 0) return false;
+        if (fingerprint.matched < AUTO_SAVE_HIGH_CONFIDENCE_MIN_MATCHED_FINGERPRINTS) return false;
+
+        // Main rule: very high fingerprint match plus at least one meaningful field.
+        if (fingerprint.percent >= AUTO_SAVE_HIGH_CONFIDENCE_FINGERPRINT_PERCENT) {
+            return true;
+        }
+
+        // Secondary rule: 17/19 and similar ratios are visually/semantically strong,
+        // but just below 90%. Allow them only when several metadata fields agree.
+        if (
+            fingerprint.percent >= AUTO_SAVE_STRONG_FIELDS_FINGERPRINT_PERCENT &&
+            fieldCount >= AUTO_SAVE_STRONG_FIELDS_MIN_FIELD_MATCHES
+        ) {
+            return true;
+        }
+
+        return false;
+    }
+
+    function findHighConfidenceAutoSaveCandidate(searchItem) {
+        if (!ENABLE_AUTO_SAVE_HIGH_CONFIDENCE_AFTER_FRAGMENT || !searchItem) return null;
+
+        const sourceText = getSearchItemSourceText(searchItem);
+        if (!sourceText) return null;
+
+        const candidates = Array.from(searchItem.querySelectorAll('li.search-result'))
+            .map((result, index) => {
+                const fingerprint = getBestFingerprintInfo(result);
+                const fields = getHighConfidenceFieldMatches(result, sourceText);
+
+                if (!isAutoSaveHighConfidenceMatch(fingerprint, fields)) return null;
+
+                const baseScore = getSearchResultScore(result, sourceText);
+                const autoSaveScore = baseScore + (fields.size * 5) + (fingerprint.percent * 10) + (fingerprint.exact ? 1 : 0);
+
+                return {
+                    result,
+                    index,
+                    fingerprint,
+                    fields,
+                    score: autoSaveScore
+                };
+            })
+            .filter(Boolean);
+
+        if (candidates.length === 0) return null;
+
+        candidates.sort((a, b) => {
+            if (b.score !== a.score) return b.score - a.score;
+            if (b.fields.size !== a.fields.size) return b.fields.size - a.fields.size;
+            if (b.fingerprint.percent !== a.fingerprint.percent) return b.fingerprint.percent - a.fingerprint.percent;
+            return a.index - b.index;
+        });
+
+        return candidates[0];
+    }
+
+    function isSaveButton(button) {
+        if (!button || button.disabled) return false;
+        const buttonText = (button.textContent || '').replace(/\s+/g, ' ').trim();
+        return AUTO_SAVE_BUTTON_TEXTS.some(expectedText => buttonText === expectedText);
+    }
+
+    function findSaveButtonForResult(result) {
+        if (!result) return null;
+
+        return Array.from(result.querySelectorAll('button.btn.btn-primary'))
+            .filter(isSaveButton)
+            .filter(isElementVisible)[0] || null;
+    }
+
+    async function autoSaveHighConfidenceResult(searchItem, triggerButton) {
+        if (!ENABLE_AUTO_SAVE_HIGH_CONFIDENCE_AFTER_FRAGMENT || !searchItem) return false;
+        if (searchItem.dataset.dmhAutoSavedHighConfidence === 'true') return false;
+
+        const candidate = findHighConfidenceAutoSaveCandidate(searchItem);
+        if (!candidate) return false;
+
+        await waitIfScrapeAutomationPaused(triggerButton, 'перед выбором результата для автосохранения');
+
+        const activeResult = searchItem.querySelector('li.search-result.active, li.search-result.selected-result');
+        if (activeResult !== candidate.result) {
+            candidate.result.dispatchEvent(new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                view: window
+            }));
+
+            if (AUTO_SAVE_CLICK_DELAY_MS > 0) {
+                await sleep(AUTO_SAVE_CLICK_DELAY_MS);
+            }
+
+            runAllHighlights();
+        }
+
+        await waitIfScrapeAutomationPaused(triggerButton, 'перед автосохранением');
+
+        let freshActiveResult = searchItem.querySelector('li.search-result.active, li.search-result.selected-result');
+        let saveButton = findSaveButtonForResult(candidate.result) || findSaveButtonForResult(freshActiveResult);
+
+        if (!saveButton && AUTO_SAVE_SAVE_BUTTON_WAIT_TIMEOUT_MS > 0) {
+            const waitStartedAt = Date.now();
+            while (!saveButton && Date.now() - waitStartedAt < AUTO_SAVE_SAVE_BUTTON_WAIT_TIMEOUT_MS) {
+                await sleep(AUTO_SAVE_SAVE_BUTTON_WAIT_INTERVAL_MS);
+                runAllHighlights();
+                freshActiveResult = searchItem.querySelector('li.search-result.active, li.search-result.selected-result');
+                saveButton = findSaveButtonForResult(candidate.result) || findSaveButtonForResult(freshActiveResult);
+            }
+        }
+
+        if (!saveButton) return false;
+
+        searchItem.dataset.dmhAutoSavedHighConfidence = 'true';
+        searchItem.dataset.dmhAutoSavedHighConfidenceReason = [
+            `fp=${candidate.fingerprint.matched}/${candidate.fingerprint.total}`,
+            `pct=${Math.round(candidate.fingerprint.percent * 100)}%`,
+            `fields=${Array.from(candidate.fields).join(',')}`
+        ].join(';');
+
+        if (AUTO_SAVE_BEFORE_SAVE_CLICK_DELAY_MS > 0) {
+            await sleep(AUTO_SAVE_BEFORE_SAVE_CLICK_DELAY_MS);
+        }
+
+        await waitIfScrapeAutomationPaused(triggerButton, 'перед нажатием «Сохранить»');
+
+        saveButton.dispatchEvent(new MouseEvent('click', {
+            bubbles: true,
+            cancelable: true,
+            view: window
+        }));
+
+        if (AUTO_SAVE_AFTER_SAVE_CLICK_DELAY_MS > 0) {
+            await sleep(AUTO_SAVE_AFTER_SAVE_CLICK_DELAY_MS);
+        }
+
+        return true;
+    }
+
+    async function autoSaveHighConfidenceResultWithRetry(searchItem, triggerButton) {
+        if (!ENABLE_AUTO_SAVE_HIGH_CONFIDENCE_AFTER_FRAGMENT || !searchItem) return false;
+
+        const startedAt = Date.now();
+
+        while (true) {
+            runAllHighlights();
+            await waitIfScrapeAutomationPaused(triggerButton, 'во время проверки кандидата для автосохранения');
+
+            const candidate = findHighConfidenceAutoSaveCandidate(searchItem);
+            if (candidate) {
+                const saved = await autoSaveHighConfidenceResult(searchItem, triggerButton);
+                if (saved) return true;
+            }
+
+            if (Date.now() - startedAt >= AUTO_SAVE_CANDIDATE_RETRY_TIMEOUT_MS) {
+                return false;
+            }
+
+            await sleep(AUTO_SAVE_CANDIDATE_RETRY_INTERVAL_MS);
+        }
+    }
+
+    function waitForScrapeComparisonData(searchItem, beforeSignature) {
+        if (!SCRAPE_BY_FRAGMENT_WAIT_FOR_RESULT || !searchItem) {
+            return Promise.resolve(true);
+        }
+
+        const startedAt = Date.now();
+        let lastScrollWakeAt = 0;
+
+        return new Promise(resolve => {
+            const check = () => {
+                if (!document.body.contains(searchItem)) {
+                    resolve(false);
+                    return;
+                }
+
+                if (hasNoScrapeResults(searchItem)) {
+                    resolve(false);
+                    return;
+                }
+
+                const now = Date.now();
+                if (
+                    ENABLE_SCRAPE_ITEM_SCROLL_WAKE &&
+                    now - lastScrollWakeAt >= SCRAPE_WAIT_SCROLL_WAKE_INTERVAL_MS
+                ) {
+                    lastScrollWakeAt = now;
+                    scrollSearchItemIntoView(searchItem);
+                }
+
+                const currentSignature = getComparisonDataSignature(searchItem);
+                const changed = currentSignature !== beforeSignature;
+
+                if (changed && hasComparisonData(searchItem)) {
+                    resolve(true);
+                    return;
+                }
+
+                if (Date.now() - startedAt >= SCRAPE_BY_FRAGMENT_WAIT_TIMEOUT_MS) {
+                    // If Stash still shows the spinner on the clicked scrape button,
+                    // do not declare timeout yet. The UI is still busy and all other
+                    // scrape buttons are intentionally disabled. Keep waiting here
+                    // instead of letting page automation jump to the next page.
+                    if (hasActiveScrapeByFragmentLoading()) {
+                        window.setTimeout(check, SCRAPE_BY_FRAGMENT_POLL_INTERVAL_MS);
+                        return;
+                    }
+
+                    resolve(false);
+                    return;
+                }
+
+                window.setTimeout(check, SCRAPE_BY_FRAGMENT_POLL_INTERVAL_MS);
+            };
+
+            window.setTimeout(check, SCRAPE_BY_FRAGMENT_POLL_INTERVAL_MS);
+        });
+    }
+
+    function setScrapeAllButtonState(button, text, disabled) {
+        if (!button) return;
+        button.textContent = text;
+        button.disabled = !!disabled;
+    }
+
+    function findNavbarNewButtonWrapper() {
+        const navbar = document.querySelector('.navbar-buttons');
+        if (!navbar) return null;
+
+        return Array.from(navbar.children).find(child => {
+            const link = child.querySelector && child.querySelector('a[href="/scenes/new"]');
+            if (!link) return false;
+
+            const button = link.querySelector('button');
+            const text = (button ? button.textContent : link.textContent || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            return /^(Новый|New)$/i.test(text);
+        }) || null;
+    }
+
+    function ensureScrapeProgressCounter() {
+        if (!ENABLE_SCRAPE_PROGRESS_NAVBAR_COUNTER) return null;
+
+        const existing = document.querySelector('[data-dmh-scrape-progress-counter="true"]');
+        if (existing) return existing;
+
+        const newButtonWrapper = findNavbarNewButtonWrapper();
+        if (!newButtonWrapper || !newButtonWrapper.parentNode) return null;
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'mr-2 d-flex align-items-center';
+        wrapper.dataset.dmhScrapeProgressCounterWrapper = 'true';
+
+        const badge = document.createElement('span');
+        badge.className = 'badge badge-secondary';
+        badge.dataset.dmhScrapeProgressCounter = 'true';
+        badge.textContent = SCRAPE_PROGRESS_NAVBAR_COUNTER_IDLE_TEXT;
+        badge.title = 'Состояние массового скрейпинга DataMatchHighlighter';
+        badge.style.whiteSpace = 'nowrap';
+        badge.style.fontSize = '0.875rem';
+        badge.style.lineHeight = '1.5';
+        badge.style.padding = '0.45rem 0.6rem';
+
+        wrapper.appendChild(badge);
+        newButtonWrapper.parentNode.insertBefore(wrapper, newButtonWrapper.nextSibling);
+
+        return badge;
+    }
+
+    let scrapeAutomationProgressState = null;
+    let scrapeAutomationPaused = false;
+
+    function isScrapeAutomationRunning() {
+        return !!(scrapeAutomationProgressState && scrapeAutomationProgressState.running);
+    }
+
+    function getScrapePauseButton() {
+        return document.querySelector('[data-dmh-scrape-pause-button="true"]');
+    }
+
+    function setElementTextIfChanged(element, text) {
+        if (!element) return;
+        if (element.textContent !== text) {
+            element.textContent = text;
+        }
+    }
+
+    function setElementTitleIfChanged(element, title) {
+        if (!element) return;
+        if (element.title !== title) {
+            element.title = title;
+        }
+    }
+
+    function setButtonDisabledIfChanged(button, disabled) {
+        if (!button) return;
+        const shouldBeDisabled = !!disabled;
+        if (button.disabled !== shouldBeDisabled) {
+            button.disabled = shouldBeDisabled;
+        }
+    }
+
+    function setButtonVisualModeIfChanged(button, wantedClass) {
+        if (!button || !wantedClass) return;
+
+        const modeClasses = ['btn-secondary', 'btn-warning', 'btn-success'];
+        modeClasses.forEach(className => {
+            const shouldHaveClass = className === wantedClass;
+            if (shouldHaveClass && !button.classList.contains(className)) {
+                button.classList.add(className);
+            } else if (!shouldHaveClass && button.classList.contains(className)) {
+                button.classList.remove(className);
+            }
+        });
+    }
+
+    function updateScrapePauseButtonState() {
+        if (!ENABLE_SCRAPE_PAUSE_BUTTON) return;
+
+        const button = getScrapePauseButton();
+        if (!button) return;
+
+        const running = isScrapeAutomationRunning();
+        const buttonText = scrapeAutomationPaused ? SCRAPE_RESUME_BUTTON_TEXT : SCRAPE_PAUSE_BUTTON_TEXT;
+        const buttonTitle = scrapeAutomationPaused
+            ? 'Продолжить массовый скрейпинг DataMatchHighlighter'
+            : 'Приостановить массовый скрейпинг DataMatchHighlighter перед следующим безопасным шагом';
+        const visualClass = !running
+            ? 'btn-secondary'
+            : (scrapeAutomationPaused ? 'btn-success' : 'btn-warning');
+
+        // Important: runAllHighlights is called by MutationObserver. Do not rewrite
+        // text/classes on every observer tick if nothing changed, otherwise simply
+        // opening the page can create a self-triggered DOM mutation loop.
+        setButtonDisabledIfChanged(button, !running);
+        setElementTextIfChanged(button, buttonText);
+        setElementTitleIfChanged(button, buttonTitle);
+        setButtonVisualModeIfChanged(button, visualClass);
+    }
+
+    function setScrapeAutomationPaused(paused) {
+        scrapeAutomationPaused = !!paused;
+        if (scrapeAutomationProgressState) {
+            scrapeAutomationProgressState.paused = scrapeAutomationPaused;
+        }
+        updateScrapePauseButtonState();
+    }
+
+    function resetScrapeAutomationPauseState() {
+        scrapeAutomationPaused = false;
+        updateScrapePauseButtonState();
+    }
+
+    async function waitIfScrapeAutomationPaused(triggerButton, contextText) {
+        if (!ENABLE_SCRAPE_PAUSE_BUTTON) return;
+
+        let lastStatusAt = 0;
+        while (scrapeAutomationPaused && isScrapeAutomationRunning()) {
+            const now = Date.now();
+            if (now - lastStatusAt >= 1000) {
+                lastStatusAt = now;
+                const label = contextText ? ` / ${contextText}` : '';
+                setScrapeAllButtonState(triggerButton, 'На паузе', true);
+                setScrapeProgressCounterState(`DMH: на паузе${label} / нажмите «${SCRAPE_RESUME_BUTTON_TEXT}»`, 'warning');
+            }
+            updateScrapePauseButtonState();
+            await sleep(SCRAPE_PAUSE_POLL_INTERVAL_MS);
+        }
+
+        updateScrapePauseButtonState();
+    }
+
+    function setScrapeAutomationProgressState(state) {
+        scrapeAutomationProgressState = state || null;
+        if (!scrapeAutomationProgressState || !scrapeAutomationProgressState.running) {
+            scrapeAutomationPaused = false;
+        } else {
+            scrapeAutomationProgressState.paused = scrapeAutomationPaused;
+        }
+        updateScrapePauseButtonState();
+    }
+
+    function incrementAutomationSavedCount() {
+        if (!scrapeAutomationProgressState || !scrapeAutomationProgressState.running) return;
+        scrapeAutomationProgressState.totalSavedCount = (scrapeAutomationProgressState.totalSavedCount || 0) + 1;
+    }
+
+    function setScrapeProgressCounterState(text, mode) {
+        const counter = ensureScrapeProgressCounter();
+        if (!counter) return;
+
+        let renderedText = text || SCRAPE_PROGRESS_NAVBAR_COUNTER_IDLE_TEXT;
+        if (
+            scrapeAutomationProgressState &&
+            scrapeAutomationProgressState.running &&
+            mode === 'running' &&
+            !/всего\s+сохр\./i.test(renderedText)
+        ) {
+            const extraParts = [];
+            if ((scrapeAutomationProgressState.totalSavedCount || 0) > 0) {
+                extraParts.push(`всего сохр. ${scrapeAutomationProgressState.totalSavedCount}`);
+            }
+            if ((scrapeAutomationProgressState.currentPageIndex || 0) > 0) {
+                extraParts.push(`стр. ${scrapeAutomationProgressState.currentPageIndex}`);
+            }
+            if (extraParts.length > 0) {
+                renderedText = `${renderedText} / ${extraParts.join(' / ')}`;
+            }
+        }
+
+        counter.textContent = renderedText;
+        counter.dataset.dmhScrapeProgressMode = mode || 'idle';
+
+        counter.classList.remove('badge-secondary', 'badge-primary', 'badge-success', 'badge-warning', 'badge-danger');
+
+        if (mode === 'running') {
+            counter.classList.add('badge-primary');
+        } else if (mode === 'done') {
+            counter.classList.add('badge-success');
+        } else if (mode === 'warning') {
+            counter.classList.add('badge-warning');
+        } else if (mode === 'error') {
+            counter.classList.add('badge-danger');
+        } else {
+            counter.classList.add('badge-secondary');
+        }
+    }
+
+    function formatScrapeProgressCounter(remaining, total, savedCount, rememberedCount, skippedByMemory) {
+        const parts = [`DMH: осталось ${remaining}/${total}`];
+        if (savedCount > 0) parts.push(`сохр. ${savedCount}`);
+        if (rememberedCount > 0) parts.push(`память ${rememberedCount}`);
+        if (skippedByMemory > 0) parts.push(`пропуск ${skippedByMemory}`);
+        return parts.join(' / ');
+    }
+
+    async function runScrapeByFragmentCurrentPagePass(triggerButton, automationLabel) {
+        const loadingFinished = await waitForActiveScrapeByFragmentLoadingToFinish(
+            triggerButton,
+            automationLabel ? `проход ${automationLabel}` : 'проход'
+        );
+        if (!loadingFinished) {
+            return {
+                allTasksCount: 0,
+                total: 0,
+                skippedByMemory: 0,
+                savedCount: 0,
+                rememberedCount: 0,
+                noRenderCount: 0,
+                blockedByLoading: true
+            };
+        }
+
+        await waitIfScrapeAutomationPaused(
+            triggerButton,
+            automationLabel ? `перед проходом ${automationLabel}` : 'перед проходом'
+        );
+
+        const allTasks = getScrapeByFragmentButtons()
+            .map(button => ({
+                button,
+                searchItem: button.closest('div.search-item')
+            }))
+            .filter(task => task.searchItem);
+
+        const rememberedAtStart = ENABLE_SCRAPE_SESSION_MEMORY_FOR_NO_AUTO_MATCH
+            ? allTasks.filter(task => isSearchItemRememberedAsNoAutoMatch(task.searchItem)).length
+            : 0;
+
+        const tasks = allTasks.filter(task => !isSearchItemRememberedAsNoAutoMatch(task.searchItem));
+        const total = tasks.length;
+        let skippedByMemory = rememberedAtStart;
+        let savedCount = 0;
+        let rememberedCount = 0;
+        let noRenderCount = 0;
+
+        if (total === 0) {
+            if (hasActiveScrapeByFragmentLoading()) {
+                const loadingFinishedAgain = await waitForActiveScrapeByFragmentLoadingToFinish(
+                    triggerButton,
+                    automationLabel ? `проход ${automationLabel}` : 'проход'
+                );
+                if (loadingFinishedAgain) {
+                    return runScrapeByFragmentCurrentPagePass(triggerButton, automationLabel);
+                }
+            }
+
+            const emptyText = skippedByMemory > 0
+                ? `Все пропущены: ${skippedByMemory}`
+                : 'Фрагменты не найдены';
+
+            setScrapeAllButtonState(triggerButton, emptyText, true);
+            setScrapeProgressCounterState(
+                skippedByMemory > 0
+                    ? `DMH: остановлен / пропущено ${skippedByMemory}`
+                    : 'DMH: нет задач / остановлен',
+                skippedByMemory > 0 ? 'warning' : 'idle'
+            );
+            return {
+                allTasksCount: allTasks.length,
+                total,
+                skippedByMemory,
+                savedCount,
+                rememberedCount,
+                noRenderCount
+            };
+        }
+
+        setScrapeAllButtonState(triggerButton, `Скрейпинг 0/${total}`, true);
+        setScrapeProgressCounterState(formatScrapeProgressCounter(total, total, savedCount, rememberedCount, skippedByMemory), 'running');
+
+        for (let index = 0; index < tasks.length; index++) {
+            const task = tasks[index];
+
+            try {
+                setScrapeProgressCounterState(formatScrapeProgressCounter(total - index, total, savedCount, rememberedCount, skippedByMemory), 'running');
+                await waitIfScrapeAutomationPaused(triggerButton, `перед элементом ${index + 1}/${total}`);
+
+            // The same filename can appear more than once on a long page. If a previous
+            // iteration remembered it as having no auto-save candidate, skip duplicate
+            // rows in the same run as well.
+            if (isSearchItemRememberedAsNoAutoMatch(task.searchItem)) {
+                skippedByMemory += 1;
+                setScrapeAllButtonState(triggerButton, `Пропуск ${index + 1}/${total}`, true);
+                setScrapeProgressCounterState(formatScrapeProgressCounter(total - index - 1, total, savedCount, rememberedCount, skippedByMemory), 'running');
+                continue;
+            }
+
+            await wakeSearchItemRendering(task.searchItem);
+            await waitIfScrapeAutomationPaused(triggerButton, `перед скрейпингом элемента ${index + 1}/${total}`);
+
+            const scrapeButton = getCurrentScrapeButtonForSearchItem(task.searchItem, task.button);
+            const beforeSignature = getComparisonDataSignature(task.searchItem);
+            let clicked = false;
+            let saved = false;
+            let waitSucceeded = false;
+
+            if (scrapeButton && !scrapeButton.disabled && isElementVisible(scrapeButton)) {
+                scrapeButton.dispatchEvent(new MouseEvent('click', {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window
+                }));
+                clicked = true;
+                scrollSearchItemIntoView(task.searchItem);
+            }
+
+            if (clicked && SCRAPE_BY_FRAGMENT_WAIT_FOR_RESULT) {
+                setScrapeAllButtonState(triggerButton, `Ожидание ${index + 1}/${total}`, true);
+                setScrapeProgressCounterState(`DMH: ожидание ${index + 1}/${total} / осталось ${total - index}`, 'running');
+                waitSucceeded = await waitForScrapeComparisonData(task.searchItem, beforeSignature);
+                runAllHighlights();
+                await waitIfScrapeAutomationPaused(triggerButton, `после получения результата ${index + 1}/${total}`);
+
+                if (!waitSucceeded && !hasNoScrapeResults(task.searchItem) && !hasComparisonData(task.searchItem)) {
+                    noRenderCount += 1;
+                    setScrapeAllButtonState(triggerButton, `Нет рендера ${index + 1}/${total}`, true);
+                    setScrapeProgressCounterState(`DMH: нет данных после ожидания ${index + 1}/${total} / продолжаю`, 'warning');
+                } else if (hasNoScrapeResults(task.searchItem)) {
+                    rememberSearchItemAsNoAutoMatch(task.searchItem, 'nothing-found');
+                    rememberedCount += 1;
+                    setScrapeAllButtonState(triggerButton, `Не найдено ${index + 1}/${total}`, true);
+                    setScrapeProgressCounterState(formatScrapeProgressCounter(total - index - 1, total, savedCount, rememberedCount, skippedByMemory), 'running');
+                } else if (ENABLE_AUTO_SAVE_HIGH_CONFIDENCE_AFTER_FRAGMENT) {
+                    saved = await autoSaveHighConfidenceResultWithRetry(task.searchItem, triggerButton);
+
+                    if (saved) {
+                        savedCount += 1;
+                        incrementAutomationSavedCount();
+                        setScrapeAllButtonState(triggerButton, `Сохранено ${index + 1}/${total}`, true);
+                        setScrapeProgressCounterState(formatScrapeProgressCounter(total - index - 1, total, savedCount, rememberedCount, skippedByMemory), 'running');
+                    } else {
+                        rememberSearchItemAsNoAutoMatch(task.searchItem, 'no-high-confidence-auto-save');
+                        rememberedCount += 1;
+                        setScrapeAllButtonState(triggerButton, `В память ${index + 1}/${total}`, true);
+                        setScrapeProgressCounterState(formatScrapeProgressCounter(total - index - 1, total, savedCount, rememberedCount, skippedByMemory), 'running');
+                    }
+                }
+            } else if (clicked && ENABLE_AUTO_SAVE_HIGH_CONFIDENCE_AFTER_FRAGMENT) {
+                runAllHighlights();
+                saved = await autoSaveHighConfidenceResultWithRetry(task.searchItem, triggerButton);
+
+                if (saved) {
+                    savedCount += 1;
+                    incrementAutomationSavedCount();
+                    setScrapeAllButtonState(triggerButton, `Сохранено ${index + 1}/${total}`, true);
+                } else {
+                    rememberSearchItemAsNoAutoMatch(task.searchItem, 'no-high-confidence-auto-save');
+                    rememberedCount += 1;
+                    setScrapeAllButtonState(triggerButton, `В память ${index + 1}/${total}`, true);
+                }
+            }
+
+            const loadingFinishedAfterItem = await waitForActiveScrapeByFragmentLoadingToFinish(
+                triggerButton,
+                `элемент ${index + 1}/${total}`
+            );
+            if (!loadingFinishedAfterItem) {
+                noRenderCount += 1;
+                return {
+                    allTasksCount: allTasks.length,
+                    total,
+                    skippedByMemory,
+                    savedCount,
+                    rememberedCount,
+                    noRenderCount,
+                    blockedByLoading: true
+                };
+            }
+
+            setScrapeAllButtonState(triggerButton, `Скрейпинг ${index + 1}/${total}`, true);
+            setScrapeProgressCounterState(formatScrapeProgressCounter(total - index - 1, total, savedCount, rememberedCount, skippedByMemory), 'running');
+
+            if (SCRAPE_BY_FRAGMENT_CLICK_DELAY_MS > 0 && index < tasks.length - 1) {
+                await waitIfScrapeAutomationPaused(triggerButton, `перед задержкой после элемента ${index + 1}/${total}`);
+                setScrapeAllButtonState(triggerButton, `Задержка ${index + 1}/${total}`, true);
+                setScrapeProgressCounterState(`DMH: задержка / осталось ${total - index - 1}/${total}`, 'running');
+                await sleep(SCRAPE_BY_FRAGMENT_CLICK_DELAY_MS);
+            }
+            } catch (error) {
+                console.warn('[DataMatchHighlighter] Mass scrape item failed, continuing:', error);
+                setScrapeAllButtonState(triggerButton, `Ошибка ${index + 1}/${total}`, true);
+                setScrapeProgressCounterState(`DMH: ошибка ${index + 1}/${total} / продолжаю`, 'warning');
+                await sleep(500);
+            }
+        }
+
+        const summaryParts = [`Готово: ${total}`];
+        if (savedCount > 0) summaryParts.push(`сохр. ${savedCount}`);
+        if (rememberedCount > 0) summaryParts.push(`память ${rememberedCount}`);
+        if (skippedByMemory > 0) summaryParts.push(`пропущ. ${skippedByMemory}`);
+
+        setScrapeAllButtonState(triggerButton, summaryParts.join(' / '), true);
+        setScrapeProgressCounterState(`DMH: готово / осталось 0/${total} / ${summaryParts.slice(1).join(' / ') || 'без действий'}`, 'done');
+        return {
+            allTasksCount: allTasks.length,
+            total,
+            skippedByMemory,
+            savedCount,
+            rememberedCount,
+            noRenderCount
+        };
+    }
+
+
+    function getPageCountText() {
+        return (document.querySelector('.page-count')?.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function getPageSearchItemsSignature() {
+        const fileNames = Array.from(document.querySelectorAll('div.search-item'))
+            .map(item => getSearchItemFileName(item))
+            .filter(Boolean)
+            .slice(0, 80)
+            .join(' || ');
+
+        const searchItemCount = document.querySelectorAll('div.search-item').length;
+        const scrapeButtonCount = getScrapeByFragmentButtons().length;
+        const allScrapeButtonCount = getAllScrapeByFragmentButtons().length;
+        const loadingButtonCount = getLoadingScrapeByFragmentButtons().length;
+
+        return `items=${searchItemCount}::buttons=${scrapeButtonCount}/${allScrapeButtonCount}::loading=${loadingButtonCount}::${fileNames}`;
+    }
+
+    function getPageAutomationSignature() {
+        return `${getPageCountText()}::${getPageSearchItemsSignature()}`;
+    }
+
+    function isNextPageButton(button) {
+        if (!button || button.disabled) return false;
+        if (button.getAttribute('aria-disabled') === 'true') return false;
+        if (button.classList && button.classList.contains('disabled')) return false;
+
+        const title = (button.getAttribute('title') || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        const text = (button.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        return /^(Следующая|Next)$/i.test(title) || text === '>';
+    }
+
+    function findNextPageButton() {
+        const paginationButtons = Array.from(document.querySelectorAll('div.pagination button, .pagination button'));
+        return paginationButtons
+            .filter(isNextPageButton)
+            .filter(isElementVisible)[0] || null;
+    }
+
+    async function waitForPageAutomationChange(beforeSignature, timeoutMs) {
+        const startedAt = Date.now();
+        let lastScrollWakeAt = 0;
+
+        while (Date.now() - startedAt < timeoutMs) {
+            const now = Date.now();
+            if (now - lastScrollWakeAt >= SCRAPE_WAIT_SCROLL_WAKE_INTERVAL_MS) {
+                lastScrollWakeAt = now;
+                dispatchScrollWakeEvents(document.body);
+            }
+
+            runAllHighlights();
+
+            const currentSignature = getPageAutomationSignature();
+            if (currentSignature && currentSignature !== beforeSignature) {
+                return true;
+            }
+
+            await sleep(SCRAPE_AUTO_NEXT_PAGE_POLL_INTERVAL_MS);
+        }
+
+        return false;
+    }
+
+    async function waitForNextPageReady(beforePageCountText, beforeItemsSignature, timeoutMs) {
+        const startedAt = Date.now();
+        let lastScrollWakeAt = 0;
+        let lastItemsSignature = '';
+        let stableSince = 0;
+        let sawPageChange = false;
+
+        while (Date.now() - startedAt < timeoutMs) {
+            const now = Date.now();
+            if (now - lastScrollWakeAt >= SCRAPE_WAIT_SCROLL_WAKE_INTERVAL_MS) {
+                lastScrollWakeAt = now;
+                dispatchScrollWakeEvents(document.body);
+            }
+
+            runAllHighlights();
+
+            if (hasActiveScrapeByFragmentLoading()) {
+                await sleep(SCRAPE_ACTIVE_LOADING_POLL_INTERVAL_MS);
+                continue;
+            }
+
+            const currentPageCountText = getPageCountText();
+            const currentItemsSignature = getPageSearchItemsSignature();
+            const searchItemCount = document.querySelectorAll('div.search-item').length;
+
+            const pageCounterChanged = !!currentPageCountText && currentPageCountText !== beforePageCountText;
+            const itemsChanged = !!currentItemsSignature && currentItemsSignature !== beforeItemsSignature;
+            if (pageCounterChanged || itemsChanged) {
+                sawPageChange = true;
+            }
+
+            // Do not let the automation treat the destination page as empty while
+            // React is still replacing rows. Wait for the new list to exist and
+            // remain stable for a short period.
+            if (sawPageChange && searchItemCount > 0 && Date.now() - startedAt >= SCRAPE_AUTO_NEXT_PAGE_MIN_WAIT_MS) {
+                if (currentItemsSignature !== lastItemsSignature) {
+                    lastItemsSignature = currentItemsSignature;
+                    stableSince = Date.now();
+                } else if (Date.now() - stableSince >= SCRAPE_AUTO_NEXT_PAGE_READY_STABLE_MS) {
+                    return true;
+                }
+            }
+
+            await sleep(SCRAPE_AUTO_NEXT_PAGE_POLL_INTERVAL_MS);
+        }
+
+        return false;
+    }
+
+    async function waitForCurrentPageActionabilityToSettle(triggerButton, contextText, timeoutMs) {
+        const startedAt = Date.now();
+        let lastSignature = '';
+        let stableSince = Date.now();
+        let lastStatusAt = 0;
+
+        while (Date.now() - startedAt < timeoutMs) {
+            const loadingFinished = await waitForActiveScrapeByFragmentLoadingToFinish(
+                triggerButton,
+                contextText || 'проверка страницы'
+            );
+            if (!loadingFinished) {
+                return { actionable: false, blockedByLoading: true, timedOut: true, count: 0 };
+            }
+
+            dispatchScrollWakeEvents(document.body);
+            runAllHighlights();
+
+            const actionableTasks = getActionableScrapeByFragmentTasks();
+            if (actionableTasks.length > 0) {
+                return {
+                    actionable: true,
+                    blockedByLoading: false,
+                    timedOut: false,
+                    count: actionableTasks.length
+                };
+            }
+
+            const currentSignature = getPageAutomationSignature();
+            if (currentSignature !== lastSignature) {
+                lastSignature = currentSignature;
+                stableSince = Date.now();
+            }
+
+            const now = Date.now();
+            if (now - lastStatusAt >= SCRAPE_ACTIVE_LOADING_STATUS_INTERVAL_MS) {
+                lastStatusAt = now;
+                const allButtonCount = getAllScrapeByFragmentButtons().length;
+                const rememberedCount = Array.from(document.querySelectorAll('div.search-item'))
+                    .filter(isSearchItemRememberedAsNoAutoMatch)
+                    .length;
+                setScrapeProgressCounterState(
+                    `DMH: ${contextText || 'страница'} / проверяю завершение / кнопок ${allButtonCount} / память ${rememberedCount}`,
+                    'running'
+                );
+            }
+
+            if (Date.now() - stableSince >= SCRAPE_AUTO_PAGE_EXHAUSTED_STABLE_MS) {
+                return {
+                    actionable: false,
+                    blockedByLoading: false,
+                    timedOut: false,
+                    count: 0
+                };
+            }
+
+            await sleep(SCRAPE_AUTO_PAGE_EXHAUSTED_CHECK_INTERVAL_MS);
+        }
+
+        return {
+            actionable: false,
+            blockedByLoading: false,
+            timedOut: true,
+            count: 0
+        };
+    }
+
+    function formatAutomationSummary(savedCount, rememberedCount, skippedByMemory, noRenderCount) {
+        const parts = [];
+        if (savedCount > 0) parts.push(`сохр. ${savedCount}`);
+        if (rememberedCount > 0) parts.push(`память ${rememberedCount}`);
+        if (skippedByMemory > 0) parts.push(`пропуск ${skippedByMemory}`);
+        if (noRenderCount > 0) parts.push(`нет рендера ${noRenderCount}`);
+        return parts.join(' / ') || 'без действий';
+    }
+
+    async function clickAllScrapeByFragmentButtons(triggerButton) {
+        if (triggerButton && triggerButton.dataset.dmhScrapeAutomationRunning === 'true') return;
+
+        if (!ENABLE_SCRAPE_AUTO_REPEAT_CURRENT_PAGE && !ENABLE_SCRAPE_AUTO_NEXT_PAGE) {
+            setScrapeAutomationProgressState({
+                running: true,
+                currentPageIndex: 1,
+                totalSavedCount: 0
+            });
+
+            try {
+                await runScrapeByFragmentCurrentPagePass(triggerButton, 'single');
+            } finally {
+                setScrapeAutomationProgressState(null);
+                window.setTimeout(() => {
+                    setScrapeAllButtonState(triggerButton, SCRAPE_BY_FRAGMENT_ALL_BUTTON_TEXT, false);
+                }, 1500);
+            }
+            return;
+        }
+
+        if (triggerButton) {
+            triggerButton.dataset.dmhScrapeAutomationRunning = 'true';
+        }
+
+        let pageIndex = 1;
+        let totalSavedCount = 0;
+        let totalRememberedCount = 0;
+        let totalSkippedByMemory = 0;
+        let totalNoRenderCount = 0;
+        let stoppedByLimit = false;
+        let stoppedBecauseNoNextPage = false;
+        let stoppedBecausePageDidNotChange = false;
+
+        setScrapeAutomationProgressState({
+            running: true,
+            currentPageIndex: pageIndex,
+            totalSavedCount: 0
+        });
+        resetScrapeAutomationPauseState();
+
+        try {
+            while (true) {
+                scrapeAutomationProgressState.currentPageIndex = pageIndex;
+
+                if (SCRAPE_AUTO_MAX_PAGES > 0 && pageIndex > SCRAPE_AUTO_MAX_PAGES) {
+                    stoppedByLimit = true;
+                    break;
+                }
+
+                let passIndex = 1;
+                let pageSavedCount = 0;
+                let pageRememberedCount = 0;
+                let pageSkippedByMemory = 0;
+                let pageNoRenderCount = 0;
+
+                while (true) {
+                    scrapeAutomationProgressState.currentPageIndex = pageIndex;
+                    await waitIfScrapeAutomationPaused(triggerButton, `стр. ${pageIndex} / перед проходом ${passIndex}`);
+
+                    if (SCRAPE_AUTO_MAX_PASSES_PER_PAGE > 0 && passIndex > SCRAPE_AUTO_MAX_PASSES_PER_PAGE) {
+                        stoppedByLimit = true;
+                        break;
+                    }
+
+                    const beforePassSignature = getPageAutomationSignature();
+                    setScrapeAllButtonState(triggerButton, `Стр. ${pageIndex}, проход ${passIndex}`, true);
+                    setScrapeProgressCounterState(
+                        `DMH: стр. ${pageIndex} / проход ${passIndex} / всего сохр. ${scrapeAutomationProgressState.totalSavedCount || 0}`,
+                        'running'
+                    );
+
+                    const stats = await runScrapeByFragmentCurrentPagePass(triggerButton, `${pageIndex}.${passIndex}`);
+                    const savedCount = stats?.savedCount || 0;
+                    const rememberedCount = stats?.rememberedCount || 0;
+                    const skippedByMemory = stats?.skippedByMemory || 0;
+                    const noRenderCount = stats?.noRenderCount || 0;
+                    const actionableCount = stats?.total || 0;
+                    const blockedByLoading = stats?.blockedByLoading === true;
+
+                    pageSavedCount += savedCount;
+                    pageRememberedCount += rememberedCount;
+                    pageSkippedByMemory = Math.max(pageSkippedByMemory, skippedByMemory);
+                    pageNoRenderCount += noRenderCount;
+
+                    totalSavedCount += savedCount;
+                    totalRememberedCount += rememberedCount;
+                    totalSkippedByMemory = Math.max(totalSkippedByMemory, skippedByMemory);
+                    totalNoRenderCount += noRenderCount;
+
+                    if (scrapeAutomationProgressState) {
+                        scrapeAutomationProgressState.totalSavedCount = totalSavedCount;
+                    }
+
+                    if (blockedByLoading) {
+                        stoppedBecausePageDidNotChange = true;
+                        setScrapeProgressCounterState('DMH: Stash всё ещё скрейпит фрагмент / переход остановлен', 'warning');
+                        break;
+                    }
+
+                    // After a successful save, Stash removes that row and can refill the
+                    // same page with a new row. Do not switch pages immediately: wait
+                    // until either a new actionable row appears, or the page has stayed
+                    // stable with no actionable rows for several seconds.
+                    if (savedCount > 0) {
+                        setScrapeAllButtonState(triggerButton, `Обновление стр. ${pageIndex}`, true);
+                        setScrapeProgressCounterState(
+                            `DMH: стр. ${pageIndex} / проход ${passIndex} сохр. ${savedCount} / всего сохр. ${totalSavedCount} / жду новые строки`,
+                            'running'
+                        );
+
+                        await waitForPageAutomationChange(
+                            beforePassSignature,
+                            Math.max(SCRAPE_AUTO_AFTER_PASS_DELAY_MS, 500)
+                        );
+                        await waitIfScrapeAutomationPaused(triggerButton, `стр. ${pageIndex} / после сохранений`);
+
+                        const actionabilityAfterSave = await waitForCurrentPageActionabilityToSettle(
+                            triggerButton,
+                            `стр. ${pageIndex} после сохранений`,
+                            SCRAPE_AUTO_PAGE_EXHAUSTED_WAIT_TIMEOUT_MS
+                        );
+
+                        if (actionabilityAfterSave.blockedByLoading) {
+                            stoppedBecausePageDidNotChange = true;
+                            break;
+                        }
+
+                        if (actionabilityAfterSave.actionable) {
+                            setScrapeProgressCounterState(
+                                `DMH: стр. ${pageIndex} / появилось новых задач ${actionabilityAfterSave.count} / всего сохр. ${totalSavedCount}`,
+                                'running'
+                            );
+                            await waitIfScrapeAutomationPaused(triggerButton, `стр. ${pageIndex} / перед новым проходом`);
+                            passIndex += 1;
+                            continue;
+                        }
+
+                        // No new actionable rows appeared after the save/refill window.
+                        // Treat the current page as exhausted and allow the outer loop
+                        // to move to the next pagination page.
+                        break;
+                    }
+
+                    // If this pass did not save anything, do one more guarded check before
+                    // leaving the page. This catches slow React refills and prevents page
+                    // jumps while rows are still appearing.
+                    const pageEndCheck = await waitForCurrentPageActionabilityToSettle(
+                        triggerButton,
+                        `стр. ${pageIndex} перед завершением`,
+                        SCRAPE_AUTO_PAGE_EXHAUSTED_WAIT_TIMEOUT_MS
+                    );
+
+                    if (pageEndCheck.blockedByLoading) {
+                        stoppedBecausePageDidNotChange = true;
+                        break;
+                    }
+
+                    if (pageEndCheck.actionable && noRenderCount === 0) {
+                        setScrapeProgressCounterState(
+                            `DMH: стр. ${pageIndex} / нашлись оставшиеся задачи ${pageEndCheck.count}, повторяю проход`,
+                            'running'
+                        );
+                        await waitIfScrapeAutomationPaused(triggerButton, `стр. ${pageIndex} / перед повтором прохода`);
+                        passIndex += 1;
+                        continue;
+                    }
+
+                    if (actionableCount === 0 || rememberedCount > 0 || skippedByMemory > 0 || noRenderCount > 0) {
+                        break;
+                    }
+
+                    break;
+                }
+
+                if (stoppedByLimit || stoppedBecausePageDidNotChange) {
+                    break;
+                }
+
+                await waitIfScrapeAutomationPaused(triggerButton, `стр. ${pageIndex} / перед завершением страницы`);
+
+                const loadingFinishedBeforePageEnd = await waitForActiveScrapeByFragmentLoadingToFinish(
+                    triggerButton,
+                    `стр. ${pageIndex} перед переходом`
+                );
+                if (!loadingFinishedBeforePageEnd) {
+                    stoppedBecausePageDidNotChange = true;
+                    break;
+                }
+
+                const finalPageEndCheck = await waitForCurrentPageActionabilityToSettle(
+                    triggerButton,
+                    `стр. ${pageIndex} финальная проверка`,
+                    SCRAPE_AUTO_PAGE_EXHAUSTED_WAIT_TIMEOUT_MS
+                );
+
+                if (finalPageEndCheck.blockedByLoading) {
+                    stoppedBecausePageDidNotChange = true;
+                    break;
+                }
+
+                if (finalPageEndCheck.actionable) {
+                    setScrapeProgressCounterState(
+                        `DMH: стр. ${pageIndex} / перед переходом найдены задачи ${finalPageEndCheck.count}, возвращаюсь к проходу`,
+                        'running'
+                    );
+                    await waitIfScrapeAutomationPaused(triggerButton, `стр. ${pageIndex} / перед возвратом к проходу`);
+                    continue;
+                }
+
+                setScrapeProgressCounterState(
+                    `DMH: стр. ${pageIndex} завершена / ${formatAutomationSummary(pageSavedCount, pageRememberedCount, pageSkippedByMemory, pageNoRenderCount)} / всего сохр. ${totalSavedCount}`,
+                    'running'
+                );
+
+                if (stoppedByLimit || !ENABLE_SCRAPE_AUTO_NEXT_PAGE) {
+                    break;
+                }
+
+                const nextPageButton = findNextPageButton();
+                if (!nextPageButton) {
+                    stoppedBecauseNoNextPage = true;
+                    break;
+                }
+
+                await waitIfScrapeAutomationPaused(triggerButton, `стр. ${pageIndex} / перед переходом на следующую страницу`);
+
+                const beforeNextPageCountText = getPageCountText();
+                const beforeNextItemsSignature = getPageSearchItemsSignature();
+                setScrapeAllButtonState(triggerButton, `Следующая стр. ${pageIndex + 1}`, true);
+                setScrapeProgressCounterState(`DMH: переход на страницу ${pageIndex + 1} / всего сохр. ${totalSavedCount} / жду загрузку`, 'running');
+
+                const loadingFinishedBeforeNextClick = await waitForActiveScrapeByFragmentLoadingToFinish(
+                    triggerButton,
+                    `стр. ${pageIndex} перед кнопкой Следующая`
+                );
+                if (!loadingFinishedBeforeNextClick) {
+                    stoppedBecausePageDidNotChange = true;
+                    break;
+                }
+
+                await waitIfScrapeAutomationPaused(triggerButton, `стр. ${pageIndex} / перед нажатием «Следующая»`);
+
+                nextPageButton.dispatchEvent(new MouseEvent('click', {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window
+                }));
+
+                let pageReady = await waitForNextPageReady(
+                    beforeNextPageCountText,
+                    beforeNextItemsSignature,
+                    SCRAPE_AUTO_NEXT_PAGE_WAIT_TIMEOUT_MS
+                );
+
+                // Fallback: sometimes React updates the list but the strict stable wait
+                // misses the exact moment. If the page counter changed and rows exist,
+                // continue instead of stopping on page 2/3.
+                if (!pageReady) {
+                    const fallbackPageChanged = getPageCountText() && getPageCountText() !== beforeNextPageCountText;
+                    const fallbackHasRows = document.querySelectorAll('div.search-item').length > 0;
+                    const loadingFinishedAfterNext = await waitForActiveScrapeByFragmentLoadingToFinish(
+                        triggerButton,
+                        `стр. ${pageIndex + 1} после перехода`
+                    );
+
+                    if (loadingFinishedAfterNext && fallbackPageChanged && fallbackHasRows) {
+                        pageReady = true;
+                    }
+                }
+
+                if (!pageReady) {
+                    stoppedBecausePageDidNotChange = true;
+                    setScrapeProgressCounterState('DMH: новая страница не загрузилась полностью / остановлен', 'warning');
+                    break;
+                }
+
+                await sleep(SCRAPE_AUTO_NEXT_PAGE_SETTLE_MS);
+                runAllHighlights();
+
+                pageIndex += 1;
+            }
+
+            const finalMode = (stoppedByLimit || stoppedBecausePageDidNotChange) ? 'warning' : 'done';
+            const finalPrefix = stoppedByLimit
+                ? 'DMH: остановлено по лимиту'
+                : (stoppedBecausePageDidNotChange
+                    ? 'DMH: остановлено / страница не изменилась'
+                    : (stoppedBecauseNoNextPage ? 'DMH: готово / следующей страницы нет' : 'DMH: готово'));
+            const summary = formatAutomationSummary(
+                totalSavedCount,
+                totalRememberedCount,
+                totalSkippedByMemory,
+                totalNoRenderCount
+            );
+
+            setScrapeAllButtonState(triggerButton, `${stoppedByLimit ? 'Лимит' : 'Готово'} / ${summary}`, true);
+            setScrapeProgressCounterState(`${finalPrefix} / страниц ${pageIndex} / ${summary} / всего сохр. ${totalSavedCount}`, finalMode);
+        } finally {
+            setScrapeAutomationProgressState(null);
+            if (triggerButton) {
+                delete triggerButton.dataset.dmhScrapeAutomationRunning;
+                window.setTimeout(() => {
+                    setScrapeAllButtonState(triggerButton, SCRAPE_BY_FRAGMENT_ALL_BUTTON_TEXT, false);
+                }, 1800);
+            }
+        }
+    }
+
+    function findScraperToolbar() {
+        return Array.from(document.querySelectorAll('div.d-flex')).find(container => {
+            const text = (container.textContent || '').replace(/\s+/g, ' ').trim();
+            const hasSubmitButton = text.includes('Отправить') || text.includes('Submit');
+            const hasClearButton = text.includes('Убрать всё') || text.includes('Clear all');
+            const hasConfigButton = !!container.querySelector('button[title="Показать конфигурацию"], button[title="Show configuration"]');
+
+            // Some Stash layouts include "Hide unmatched scenes", and some do not.
+            // The stable anchors for this toolbar are Submit + Clear all + Config.
+            return hasSubmitButton && hasClearButton && hasConfigButton;
+        });
+    }
+
+    function ensureScrapeByFragmentAllButton() {
+        if (!ENABLE_SCRAPE_BY_FRAGMENT_ALL_BUTTON) return;
+
+        const toolbar = findScraperToolbar();
+        if (!toolbar) return;
+        if (toolbar.querySelector('[data-dmh-scrape-all-button="true"]')) return;
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'ml-1';
+        wrapper.dataset.dmhScrapeAllButton = 'true';
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn btn-primary';
+        button.textContent = SCRAPE_BY_FRAGMENT_ALL_BUTTON_TEXT;
+        button.title = 'Последовательно нажать все «Скрейпить по фрагменту» и дождаться появления данных для сравнения';
+        button.dataset.dmhScrapeAllButton = 'true';
+        button.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            clickAllScrapeByFragmentButtons(button).catch(error => {
+                console.error('[DataMatchHighlighter] Mass scrape failed:', error);
+                setScrapeAllButtonState(button, SCRAPE_BY_FRAGMENT_ALL_BUTTON_TEXT, false);
+                setScrapeProgressCounterState('DMH: ошибка / остановлен', 'error');
+            });
+        });
+
+        wrapper.appendChild(button);
+
+        const configButtonWrapper = Array.from(toolbar.children).find(child =>
+            child.querySelector('button[title="Показать конфигурацию"], button[title="Show configuration"]')
+        );
+
+        if (configButtonWrapper) {
+            toolbar.insertBefore(wrapper, configButtonWrapper);
+        } else {
+            toolbar.appendChild(wrapper);
+        }
+    }
+
+    function clampScrapePauseFloatingPosition(position) {
+        const viewportWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+        const viewportHeight = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+        const fallbackLeft = Math.min(SCRAPE_PAUSE_FLOATING_DEFAULT_LEFT_PX, Math.max(0, viewportWidth - 180));
+        const fallbackTop = Math.min(SCRAPE_PAUSE_FLOATING_DEFAULT_TOP_PX, Math.max(0, viewportHeight - 80));
+        const left = Number.isFinite(position?.left) ? position.left : fallbackLeft;
+        const top = Number.isFinite(position?.top) ? position.top : fallbackTop;
+
+        return {
+            left: Math.max(8, Math.min(left, Math.max(8, viewportWidth - 170))),
+            top: Math.max(8, Math.min(top, Math.max(8, viewportHeight - 72)))
+        };
+    }
+
+    function readScrapePauseFloatingPosition() {
+        try {
+            const raw = window.localStorage.getItem(SCRAPE_PAUSE_FLOATING_POSITION_KEY);
+            if (!raw) return clampScrapePauseFloatingPosition(null);
+            const parsed = JSON.parse(raw);
+            return clampScrapePauseFloatingPosition(parsed);
+        } catch (error) {
+            console.warn('[DataMatchHighlighter] Failed to read pause button position:', error);
+            return clampScrapePauseFloatingPosition(null);
+        }
+    }
+
+    function writeScrapePauseFloatingPosition(position) {
+        try {
+            window.localStorage.setItem(SCRAPE_PAUSE_FLOATING_POSITION_KEY, JSON.stringify({
+                left: Math.round(position.left),
+                top: Math.round(position.top)
+            }));
+        } catch (error) {
+            console.warn('[DataMatchHighlighter] Failed to save pause button position:', error);
+        }
+    }
+
+    function applyScrapePauseFloatingPosition(wrapper, position) {
+        if (!wrapper) return;
+        const safePosition = clampScrapePauseFloatingPosition(position);
+        wrapper.style.left = `${Math.round(safePosition.left)}px`;
+        wrapper.style.top = `${Math.round(safePosition.top)}px`;
+        wrapper.style.right = 'auto';
+        wrapper.style.bottom = 'auto';
+    }
+
+    function makeScrapePauseFloatingPanelDraggable(wrapper, dragHandle) {
+        if (!wrapper || !dragHandle || wrapper.dataset.dmhScrapePauseDragReady === 'true') return;
+        wrapper.dataset.dmhScrapePauseDragReady = 'true';
+
+        let dragging = false;
+        let pointerId = null;
+        let startClientX = 0;
+        let startClientY = 0;
+        let startLeft = 0;
+        let startTop = 0;
+
+        const startDrag = event => {
+            if (event.button !== undefined && event.button !== 0) return;
+
+            dragging = true;
+            pointerId = event.pointerId;
+            const rect = wrapper.getBoundingClientRect();
+            startClientX = event.clientX;
+            startClientY = event.clientY;
+            startLeft = rect.left;
+            startTop = rect.top;
+
+            dragHandle.style.cursor = 'grabbing';
+            wrapper.style.userSelect = 'none';
+            wrapper.style.transition = 'none';
+
+            try {
+                dragHandle.setPointerCapture(pointerId);
+            } catch (error) {
+                // Pointer capture is best-effort; dragging still works without it.
+            }
+
+            event.preventDefault();
+            event.stopPropagation();
+        };
+
+        const moveDrag = event => {
+            if (!dragging) return;
+            if (pointerId !== null && event.pointerId !== pointerId) return;
+
+            const nextPosition = clampScrapePauseFloatingPosition({
+                left: startLeft + event.clientX - startClientX,
+                top: startTop + event.clientY - startClientY
+            });
+            applyScrapePauseFloatingPosition(wrapper, nextPosition);
+
+            event.preventDefault();
+            event.stopPropagation();
+        };
+
+        const finishDrag = event => {
+            if (!dragging) return;
+            if (pointerId !== null && event.pointerId !== pointerId) return;
+
+            dragging = false;
+            pointerId = null;
+            dragHandle.style.cursor = 'grab';
+            wrapper.style.userSelect = '';
+            wrapper.style.transition = '';
+
+            const rect = wrapper.getBoundingClientRect();
+            writeScrapePauseFloatingPosition(clampScrapePauseFloatingPosition({
+                left: rect.left,
+                top: rect.top
+            }));
+
+            event.preventDefault();
+            event.stopPropagation();
+        };
+
+        dragHandle.addEventListener('pointerdown', startDrag);
+        window.addEventListener('pointermove', moveDrag, true);
+        window.addEventListener('pointerup', finishDrag, true);
+        window.addEventListener('pointercancel', finishDrag, true);
+        window.addEventListener('resize', () => {
+            const rect = wrapper.getBoundingClientRect();
+            const safePosition = clampScrapePauseFloatingPosition({ left: rect.left, top: rect.top });
+            applyScrapePauseFloatingPosition(wrapper, safePosition);
+            writeScrapePauseFloatingPosition(safePosition);
+        });
+    }
+
+    function ensureScrapePauseButton() {
+        if (!ENABLE_SCRAPE_PAUSE_BUTTON) return;
+
+        const existingWrapper = document.querySelector('[data-dmh-scrape-pause-button-wrapper="true"]');
+        if (existingWrapper) {
+            updateScrapePauseButtonState();
+            return;
+        }
+
+        const wrapper = document.createElement('div');
+        wrapper.dataset.dmhScrapePauseButtonWrapper = 'true';
+        wrapper.style.position = 'fixed';
+        wrapper.style.zIndex = '2147483647';
+        wrapper.style.display = 'flex';
+        wrapper.style.alignItems = 'center';
+        wrapper.style.gap = '0.35rem';
+        wrapper.style.padding = '0.45rem';
+        wrapper.style.borderRadius = '0.5rem';
+        wrapper.style.background = 'rgba(28, 32, 36, 0.92)';
+        wrapper.style.boxShadow = '0 0.35rem 1.2rem rgba(0, 0, 0, 0.35)';
+        wrapper.style.backdropFilter = 'blur(2px)';
+        wrapper.style.pointerEvents = 'auto';
+
+        const dragHandle = document.createElement('button');
+        dragHandle.type = 'button';
+        dragHandle.className = 'btn btn-dark btn-sm';
+        dragHandle.textContent = '↕';
+        dragHandle.title = 'Перетащить кнопку паузы';
+        dragHandle.dataset.dmhScrapePauseDragHandle = 'true';
+        dragHandle.style.cursor = 'grab';
+        dragHandle.style.lineHeight = '1';
+        dragHandle.style.padding = '0.35rem 0.45rem';
+        dragHandle.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn btn-secondary btn-sm';
+        button.textContent = SCRAPE_PAUSE_BUTTON_TEXT;
+        button.disabled = true;
+        button.title = 'Приостановить массовый скрейпинг DataMatchHighlighter перед следующим безопасным шагом';
+        button.dataset.dmhScrapePauseButton = 'true';
+        button.style.whiteSpace = 'nowrap';
+        button.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+
+            if (!isScrapeAutomationRunning()) {
+                updateScrapePauseButtonState();
+                return;
+            }
+
+            const nextPaused = !scrapeAutomationPaused;
+            setScrapeAutomationPaused(nextPaused);
+            if (nextPaused) {
+                setScrapeProgressCounterState(`DMH: пауза запрошена / дождусь безопасной точки`, 'warning');
+            } else {
+                setScrapeProgressCounterState(`DMH: продолжаю`, 'running');
+            }
+        });
+
+        wrapper.appendChild(dragHandle);
+        wrapper.appendChild(button);
+        applyScrapePauseFloatingPosition(wrapper, readScrapePauseFloatingPosition());
+        document.body.appendChild(wrapper);
+        makeScrapePauseFloatingPanelDraggable(wrapper, dragHandle);
+
+        updateScrapePauseButtonState();
+    }
+
+    function ensureClearScrapeSessionMemoryButton() {
+        if (!ENABLE_CLEAR_SCRAPE_SESSION_MEMORY_BUTTON || !ENABLE_SCRAPE_SESSION_MEMORY_FOR_NO_AUTO_MATCH) return;
+
+        const toolbar = findScraperToolbar();
+        if (!toolbar) return;
+        if (toolbar.querySelector('[data-dmh-clear-scrape-memory-button="true"]')) return;
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'ml-1';
+        wrapper.dataset.dmhClearScrapeMemoryButton = 'true';
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn btn-secondary';
+        button.textContent = CLEAR_SCRAPE_SESSION_MEMORY_BUTTON_TEXT;
+        button.title = 'Очистить память файлов, для которых в этой сессии не было найдено автоматическое совпадение';
+        button.dataset.dmhClearScrapeMemoryButton = 'true';
+        button.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+
+            const clearedCount = clearNoAutoMatchMemorySet();
+            button.textContent = `Память очищена (${clearedCount})`;
+            setScrapeProgressCounterState(`DMH: память очищена (${clearedCount}) / остановлен`, 'done');
+
+            window.setTimeout(() => {
+                button.textContent = CLEAR_SCRAPE_SESSION_MEMORY_BUTTON_TEXT;
+            }, 1800);
+        });
+
+        wrapper.appendChild(button);
+
+        const configButtonWrapper = Array.from(toolbar.children).find(child =>
+            child.querySelector('button[title="Показать конфигурацию"], button[title="Show configuration"]')
+        );
+
+        if (configButtonWrapper) {
+            toolbar.insertBefore(wrapper, configButtonWrapper);
+        } else {
+            toolbar.appendChild(wrapper);
+        }
+    }
+
+    // Run all highlight behaviours together
+    function runAllHighlights() {
+        highlightMatches();
+        highlightFingerprints();
+        ensureScrapeByFragmentAllButton();
+        ensureScrapePauseButton();
+        ensureClearScrapeSessionMemoryButton();
+        ensureScrapeProgressCounter();
+    }
+
+    // MutationObserver to watch for DOM changes and trigger the highlight functions
+    const observer = new MutationObserver(runAllHighlights);
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Initial execution of the highlight functions when the page is loaded
+    window.addEventListener('load', runAllHighlights);
+})();
