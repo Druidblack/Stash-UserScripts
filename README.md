@@ -65,3 +65,15 @@ Color-coding the best match of the found information to identify the video and a
 
 [![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/stash-DataMatchHighlighter.user.js)
 [![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/stash-DataMatchHighlighter.user.js)
+
+## Stasharr v2”
+
+<img width="553" height="433" alt="00000" src="https://github.com/user-attachments/assets/ff459e33-3817-4d9c-aae2-053df76fcce3" />
+
+<img width="576" height="455" alt="8885555" src="https://github.com/user-attachments/assets/75b9e38b-df92-4d32-9325-7e7d05004492" />
+
+
+It matches your data from stash and whisparr v2 and shows whether you have this content and whether you are tracking this studio. It works on the stash and tpdb websites.
+
+[![Source](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Source-button.png)](https://github.com/Druidblack/Stash-UserScripts/blob/main/stasharrv2.user.js)
+[![Install](https://github.com/Druidblack/MusicBrainz-UserScripts/blob/main/add/Install-button.png)](https://github.com/Druidblack/Stash-UserScripts/raw/main/stasharrv2.user.js)
